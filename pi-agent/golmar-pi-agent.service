@@ -1,0 +1,14 @@
+[Unit]
+Description=Golmar Pi Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/pi/dev/golmar-pi-agent
+ExecStart=/usr/bin/python3 /home/pi/dev/golmar-pi-agent/agent.py
+Restart=always
+RestartSec=3
+User=pi
+
+[Install]
+WantedBy=multi-user.target

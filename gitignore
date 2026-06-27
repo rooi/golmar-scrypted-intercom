@@ -1,0 +1,28 @@
+cat > .gitignore <<'EOF'
+# macOS
+.DS_Store
+
+# Node / Scrypted
+node_modules/
+dist/
+zip/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Audio/video test output
+*.wav
+*.raw
+*.aac
+golmar-combined-test.mp4
+golmar-mic-*.wav
+golmar-mic-*.aac
+
+# Logs
+*.log
+EOF

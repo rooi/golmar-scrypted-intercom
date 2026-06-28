@@ -160,9 +160,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
             // Pi endpoint verwacht raw PCM:
             '-acodec', 'pcm_s16le',
-            //'-ac', '1',
-            //'-ar', '48000',
-            //'-f', 's16le',
+            '-ac', '1',
+            '-ar', '48000',
+            '-f', 's16le',
 
             outputUrl,
         ];

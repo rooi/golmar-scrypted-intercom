@@ -63,11 +63,18 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
     private intercomProcess?: ChildProcessWithoutNullStreams;
 
+    private streamGeneration = 0;
+
     constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
         super(nativeId);
 
         // Start iets later zodat Scrypted/device init rustig klaar is.
         setTimeout(() => this.connectPiWebSocket(), 1000);
+    }
+
+    private bumpStreamGeneration(reason: string) {
+        this.streamGeneration++;
+        this.console.log(`Stream generation bumped to ${this.streamGeneration}: ${reason}`);
     }
 
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
@@ -84,7 +91,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'people.mp4');
         
         // G.711 μ-law is used because live AAC/ADTS fails when Scrypted rebroadcasts to RTSP.
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${Date.now()}`;
+        const session = `${Date.now()}-${this.streamGeneration}`;
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${session}`;
 
         this.console.log(`Using video file: ${file}`);
         this.console.log(`Using mic URL: ${micUrl}`);
@@ -97,6 +105,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
                 '-fflags', 'nobuffer',
                 '-flags', 'low_delay',
+                '-avioflags', 'direct',
                 '-probesize', '32',
                 '-analyzeduration', '0',
                 '-f', 'mulaw',
@@ -128,7 +137,10 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     async startIntercom(media: MediaObject): Promise<void> {
         this.console.log('Intercom start requested');
 
-        await this.stopIntercom();
+        if (this.intercomProcess && !this.intercomProcess.killed) {
+            this.console.log('Intercom ffmpeg already running, not starting another one.');
+            return;
+        }
 
         const ffmpegInput: FFmpegInput = JSON.parse(
             (await mediaManager.convertMediaObjectToBuffer(
@@ -376,6 +388,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         this.piWs.onopen = () => {
             this.piWsConnected = true;
+            this.bumpStreamGeneration('Pi WebSocket connected');
             this.console.log(`Pi WebSocket connected: ${url}`);
         };
 
@@ -391,6 +404,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             this.console.warn('Pi WebSocket closed');
             this.piWsConnected = false;
             this.piWs = undefined;
+            this.bumpStreamGeneration('Pi WebSocket closed');
 
             this.rejectPendingWsCommands(new Error('Pi WebSocket closed'));
             this.schedulePiWsReconnect();

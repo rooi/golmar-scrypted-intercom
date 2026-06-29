@@ -1,14 +1,16 @@
 [Unit]
-Description=Golmar Pi Agent
-After=network-online.target
+Description=Golmar Scrypted Pi Agent
+After=network-online.target sound.target
 Wants=network-online.target
 
 [Service]
-WorkingDirectory=/home/pi/dev/golmar-pi-agent
-ExecStart=/usr/bin/python3 /home/pi/dev/golmar-pi-agent/agent.py
-Restart=always
-RestartSec=3
+Type=simple
 User=pi
+WorkingDirectory=/home/pi/dev/golmar-scrypted-intercom/pi-agent
+ExecStart=/home/pi/venvs/automationhat/bin/python /home/pi/dev/golmar-scrypted-intercom/pi-agent/agent.py
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

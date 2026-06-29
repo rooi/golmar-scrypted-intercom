@@ -93,6 +93,64 @@ MIC_INPUT_CHANNELS = "2"
 MIC_OUTPUT_RATE = "48000"
 MIC_OUTPUT_CHANNELS = "1"
 
+AUDIO_RELAY_ENABLED = True
+AUDIO_RELAY_SETTLE_SECONDS = 0.10
+
+audio_relay_lock = threading.Lock()
+audio_relay_users = 0
+
+
+def set_audio_relay(enabled: bool):
+    """
+    Schakel de NO relay voor audio-out.
+    Draait bewust via de automationhat-venv, net als unlock_door().
+    """
+    if not AUDIO_RELAY_ENABLED:
+        return
+
+    state = "on" if enabled else "off"
+    print(f"Audio relay {state}", flush=True)
+
+    subprocess.run([
+        PYTHON,
+        "-c",
+        (
+            "import automationhat; "
+            f"automationhat.relay.one.{state}()"
+        )
+    ], check=True)
+
+
+def audio_relay_acquire():
+    """
+    Zet relay aan wanneer de eerste speaker-stream start.
+    Reference-counted zodat overlappende streams elkaar niet afschakelen.
+    """
+    global audio_relay_users
+
+    with audio_relay_lock:
+        audio_relay_users += 1
+        if audio_relay_users == 1:
+            set_audio_relay(True)
+            time.sleep(AUDIO_RELAY_SETTLE_SECONDS)
+
+
+def audio_relay_release():
+    """
+    Zet relay uit wanneer de laatste speaker-stream stopt.
+    """
+    global audio_relay_users
+
+    with audio_relay_lock:
+        if audio_relay_users > 0:
+            audio_relay_users -= 1
+
+        if audio_relay_users == 0:
+            try:
+                set_audio_relay(False)
+            except Exception as e:
+                print("Audio relay off failed:", e, flush=True)
+
 @app.route("/speaker/raw", methods=["POST", "PUT"])
 def speaker_raw():
     print("Speaker raw stream started", flush=True)
@@ -100,16 +158,21 @@ def speaker_raw():
     total_bytes = 0
     chunks = 0
     started = time.time()
-
-    process = subprocess.Popen([
-        "aplay",
-        "-D", SPEAKER_DEVICE,
-        "-f", "S16_LE",
-        "-r", SPEAKER_RATE,
-        "-c", SPEAKER_CHANNELS,
-    ], stdin=subprocess.PIPE)
+    process = None
 
     try:
+        # Relay eerst aanzetten, zodat de audio-uitgang gekoppeld is
+        # voordat aplay begint te spelen.
+        audio_relay_acquire()
+
+        process = subprocess.Popen([
+            "aplay",
+            "-D", SPEAKER_DEVICE,
+            "-f", "S16_LE",
+            "-r", SPEAKER_RATE,
+            "-c", SPEAKER_CHANNELS,
+        ], stdin=subprocess.PIPE)
+
         while True:
             chunk = request.stream.read(4096)
             if not chunk:
@@ -132,16 +195,28 @@ def speaker_raw():
         print("Speaker raw stream error:", e, flush=True)
 
     finally:
-        try:
-            if process.stdin:
-                process.stdin.close()
-        except Exception:
-            pass
+        if process:
+            try:
+                if process.stdin:
+                    process.stdin.close()
+            except Exception:
+                pass
 
-        try:
-            process.terminate()
-        except Exception:
-            pass
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+        # Relay altijd uit bij einde praten / afgebroken stream.
+        audio_relay_release()
 
         elapsed = time.time() - started
         print(f"Speaker raw stream ended: {total_bytes} bytes in {elapsed:.1f}s", flush=True)

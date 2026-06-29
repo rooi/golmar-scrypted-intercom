@@ -95,15 +95,11 @@ MIC_OUTPUT_CHANNELS = "1"
 
 @app.route("/speaker/raw", methods=["POST", "PUT"])
 def speaker_raw():
-    """
-    Ontvang raw PCM audio en speel af via USB audio.
-
-    Verwacht:
-    - signed 16-bit little endian
-    - mono
-    - 8000 Hz
-    """
     print("Speaker raw stream started", flush=True)
+
+    total_bytes = 0
+    chunks = 0
+    started = time.time()
 
     process = subprocess.Popen([
         "aplay",
@@ -118,6 +114,13 @@ def speaker_raw():
             chunk = request.stream.read(4096)
             if not chunk:
                 break
+
+            total_bytes += len(chunk)
+            chunks += 1
+
+            if chunks % 50 == 0:
+                elapsed = time.time() - started
+                print(f"Speaker received {total_bytes} bytes in {elapsed:.1f}s", flush=True)
 
             process.stdin.write(chunk)
             process.stdin.flush()
@@ -140,11 +143,13 @@ def speaker_raw():
         except Exception:
             pass
 
-        print("Speaker raw stream ended", flush=True)
+        elapsed = time.time() - started
+        print(f"Speaker raw stream ended: {total_bytes} bytes in {elapsed:.1f}s", flush=True)
 
     return jsonify({
         "ok": True,
         "type": "speaker_raw",
+        "bytes": total_bytes,
     })
 
 @app.get("/mic/raw")

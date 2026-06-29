@@ -82,9 +82,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.console.log(`getVideoStream requested: ${JSON.stringify(options)}`);
 
         const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'people.mp4');
-        //const micUrl = `${this.getPiBaseUrl()}/mic/raw-live`;
-        //const micUrl = `${this.getPiBaseUrl()}/mic/aac`;
-        //const micUrl = `${this.getPiBaseUrl()}/mic/alaw`;
+        
+        // G.711 μ-law is used because live AAC/ADTS fails when Scrypted rebroadcasts to RTSP.
         const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
 
         this.console.log(`Using video file: ${file}`);
@@ -121,7 +120,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             id: 'stream',
             name: 'Golmar Stream',
             audio: {
-                codec: 'pcm_mulaw',
+                codec: 'opus',
             },
             video: {
                 codec: 'h264',
@@ -146,25 +145,40 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const ffmpegPath = await mediaManager.getFFmpegPath();
         const outputUrl = `${this.getPiBaseUrl()}/speaker/raw`;
 
+        const inputArguments = [...ffmpegInput.inputArguments];
+
+        // HomeKit geeft soms een lokale RTSP intercom stream zonder transport.
+        // Voeg dan expliciet TCP toe vóór de bijbehorende -i.
+        // Safari/WebRTC levert dit meestal al correct aan; dan wijzigen we niets.
+        const rtspUrlIndex = inputArguments.findIndex(arg =>
+            typeof arg === 'string' && arg.startsWith('rtsp://')
+        );
+
+        if (rtspUrlIndex >= 0 && !inputArguments.includes('-rtsp_transport')) {
+            const inputFlagIndex = inputArguments.lastIndexOf('-i', rtspUrlIndex);
+
+            if (inputFlagIndex >= 0) {
+                inputArguments.splice(inputFlagIndex, 0, '-rtsp_transport', 'tcp');
+            }
+        }
+
+        this.console.log(`Normalized intercom input args: ${JSON.stringify(inputArguments)}`);
+
         const args = [
-            '-hide_banner',
-            '-loglevel', 'warning',
-            '-nostdin',
+        '-hide_banner',
+        '-loglevel', 'warning',
+        '-nostdin',
 
-            ...ffmpegInput.inputArguments,
+        ...inputArguments,
 
-            '-vn',
-
-            // Intercom/telefoonbandbreedte, vergelijkbaar met je test.
-            '-af', 'highpass=f=300,lowpass=f=3400,volume=8,alimiter=limit=0.85',
-
-            // Pi endpoint verwacht raw PCM:
-            '-acodec', 'pcm_s16le',
-            '-ac', '1',
-            '-ar', '48000',
-            '-f', 's16le',
-
-            outputUrl,
+        '-vn',
+        '-af', 'highpass=f=300,lowpass=f=3400,volume=8,alimiter=limit=0.85',
+        '-acodec', 'pcm_s16le',
+        '-ac', '1',
+        '-ar', '48000',
+        '-f', 's16le',
+        '-method', 'POST',
+        outputUrl,
         ];
 
         this.console.log(`Starting intercom ffmpeg: ${ffmpegPath} ${args.join(' ')}`);

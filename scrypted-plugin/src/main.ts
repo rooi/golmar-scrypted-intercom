@@ -119,9 +119,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         return [{
             id: 'stream',
             name: 'Golmar Stream',
-            audio: {
-                codec: 'pcm_mulaw',
-            },
             video: {
                 codec: 'h264',
             }

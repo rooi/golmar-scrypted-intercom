@@ -238,7 +238,7 @@ def mic_aac():
             "-i", "plughw:1,0",
 
             "-vn",
-            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15,alimiter=limit=0.85",
+            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15" #,alimiter=limit=0.85",
 
             "-acodec", "aac",
             "-profile:a", "aac_low",
@@ -388,7 +388,7 @@ def mic_alaw():
             "-i", "plughw:1,0",
 
             "-vn",
-            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=30,alimiter=limit=0.85",
+            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=30" #,alimiter=limit=0.85",
 
             "-acodec", "pcm_alaw",
             "-ac", "1",
@@ -463,7 +463,7 @@ def mic_opus():
 
             "-vn",
 
-            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=30,alimiter=limit=0.85",
+            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=30" #,alimiter=limit=0.85",
 
             "-acodec", "libopus",
             "-application", "voip",
@@ -540,7 +540,7 @@ def mic_wav():
             "-i", "plughw:1,0",
 
             "-vn",
-            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15,alimiter=limit=0.85",
+            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15" #,alimiter=limit=0.85",
 
             "-acodec", "pcm_s16le",
             "-ac", "1",
@@ -613,7 +613,7 @@ def mic_raw_live():
             "-i", "plughw:1,0",
 
             "-vn",
-            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15,alimiter=limit=0.85",
+            "-af", "pan=mono|c0=c1,highpass=f=300,lowpass=f=3400,volume=15" #,alimiter=limit=0.85",
 
             "-acodec", "pcm_s16le",
             "-ac", "1",

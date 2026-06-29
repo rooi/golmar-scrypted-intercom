@@ -84,7 +84,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'people.mp4');
         
         // G.711 μ-law is used because live AAC/ADTS fails when Scrypted rebroadcasts to RTSP.
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${Date.now()}`;
 
         this.console.log(`Using video file: ${file}`);
         this.console.log(`Using mic URL: ${micUrl}`);
@@ -120,7 +120,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             id: 'stream',
             name: 'Golmar Stream',
             audio: {
-                codec: 'opus',
+                codec: 'pcm_mulaw',
             },
             video: {
                 codec: 'h264',
@@ -207,17 +207,35 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     async stopIntercom(): Promise<void> {
         this.console.log('Intercom stop requested');
 
-        if (!this.intercomProcess) {
+        const process = this.intercomProcess;
+        if (!process) {
             return;
         }
 
+        this.intercomProcess = undefined;
+
         try {
-            this.intercomProcess.kill('SIGTERM');
+            process.kill('SIGTERM');
         } catch (e) {
             this.console.warn(`Failed to stop intercom ffmpeg: ${e}`);
+            return;
         }
 
-        this.intercomProcess = undefined;
+        await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => {
+                try {
+                    process.kill('SIGKILL');
+                } catch {
+                    // ignore
+                }
+                resolve();
+            }, 1000);
+
+            process.once('exit', () => {
+                clearTimeout(timeout);
+                resolve();
+            });
+        });
     }
 
     async getSettings(): Promise<Setting[]> {

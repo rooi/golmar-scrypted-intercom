@@ -105,7 +105,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
                 '-fflags', 'nobuffer',
                 '-flags', 'low_delay',
-                '-avioflags', 'direct',
                 '-probesize', '32',
                 '-analyzeduration', '0',
                 '-f', 'mulaw',
@@ -130,6 +129,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             name: 'Golmar Stream',
             video: {
                 codec: 'h264',
+            },
+            audio: {
+                codec: 'pcm_mulaw',
             }
         }];
     }

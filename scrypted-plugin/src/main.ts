@@ -109,7 +109,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         process.env.SCRYPTED_PLUGIN_VOLUME || '/tmp',
         'golmar-snapshot.jpg'
     );
-
     private streamGeneration = 0;
 
     private startupSnapshotPromise?: Promise<void>;
@@ -368,10 +367,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const inputArguments: string[] = [];
 
         if (videoMode === 'snapshot') {
-            // Bij stream-start meteen een verse snapshot proberen.
-            // Audio blijft ondertussen gewoon de Pi mic stream.
-            await this.refreshSnapshotSafely('stream start');
-
+            
+            
             if (!fs.existsSync(this.snapshotCachePath)) {
                 this.console.warn('No cached snapshot available, using fallback dog image.');
                 fs.writeFileSync(this.snapshotCachePath, dogImage);
@@ -461,8 +458,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
                 '-sc_threshold', '0',
                 '-bf', '0',
 
-                // Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
-                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
+                //// Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
+                //'-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0:tune=zerolatency',
 
                 // Stilstaand beeld heeft weinig bitrate nodig.
                 '-b:v', '150k',

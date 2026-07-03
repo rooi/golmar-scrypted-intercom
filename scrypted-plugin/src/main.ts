@@ -28,6 +28,7 @@ import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import fs from 'fs';
 import path from 'path';
+import { createServer, Server, ServerResponse } from 'http';
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
@@ -55,6 +56,45 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             description: 'Example: ws://10.0.1.41:8766',
             defaultValue: 'ws://10.0.1.41:8766',
         },
+
+        videoMode: {
+            title: 'Video Mode',
+            description: 'live = live RTSP video. snapshot = still image video with live audio.',
+            choices: ['live', 'snapshot'],
+            defaultValue: 'live',
+        },
+        cameraRtspUrl: {
+            title: 'Camera RTSP URL',
+            description: 'RTSP source for live video and snapshots.',
+            defaultValue: '',
+        },
+        videoCrop: {
+            title: 'Video Crop',
+            description: 'FFmpeg video filter for crop/snapshot. Example: crop=1280:720:1280:720',
+            defaultValue: 'crop=1280:720:1280:720',
+        },
+        videoWidth: {
+            title: 'Video Width',
+            defaultValue: '1280',
+        },
+        videoHeight: {
+            title: 'Video Height',
+            defaultValue: '720',
+        },
+        videoFps: {
+            title: 'Video FPS',
+            defaultValue: '15',
+        },
+        snapshotVideoFps: {
+            title: 'Snapshot Video FPS',
+            description: 'FPS for still-image video mode. 1 to 5 is usually enough.',
+            defaultValue: '2',
+        },
+        snapshotRefreshSeconds: {
+            title: 'Snapshot Refresh Seconds',
+            description: 'How often to refresh the still image while a snapshot video stream is active. Set 0 to disable.',
+            defaultValue: '10',
+        },
     });
 
     private piWs: any;
@@ -65,13 +105,42 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
     private intercomProcess?: ChildProcessWithoutNullStreams;
 
+    private snapshotCachePath = path.join(
+        process.env.SCRYPTED_PLUGIN_VOLUME || '/tmp',
+        'golmar-snapshot.jpg'
+    );
     private streamGeneration = 0;
+
+    private startupSnapshotPromise?: Promise<void>;
+    private snapshotReady = false;
+
+    private snapshotRefreshTimer?: any;
+    private snapshotRefreshRunning = false;
+    private snapshotRefreshLeaseTimer?: any;
 
     constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
         super(nativeId);
 
         // Start iets later zodat Scrypted/device init rustig klaar is.
         setTimeout(() => this.connectPiWebSocket(), 1000);
+
+        // Maak één snapshot bij opstarten. Daarna hergebruiken.
+        setTimeout(() => {
+            this.startupSnapshotPromise = this.refreshSnapshot()
+                .then(() => {
+                    this.snapshotReady = true;
+                    this.console.log(`Startup snapshot ready: ${this.snapshotCachePath}`);
+                })
+                .catch(e => {
+                    this.console.warn(`Startup snapshot failed, using fallback later: ${e}`);
+
+                    if (!fs.existsSync(this.snapshotCachePath)) {
+                        fs.writeFileSync(this.snapshotCachePath, dogImage);
+                    }
+
+                    this.snapshotReady = false;
+                });
+        }, 2000);
     }
 
     private bumpStreamGeneration(reason: string) {
@@ -79,45 +148,351 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.console.log(`Stream generation bumped to ${this.streamGeneration}: ${reason}`);
     }
 
+    async refreshSnapshot(): Promise<Buffer> {
+        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
+        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
+
+        if (!cameraRtspUrl) {
+            fs.writeFileSync(this.snapshotCachePath, dogImage);
+            return dogImage;
+        }
+
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+
+        const args = [
+            '-hide_banner',
+            '-loglevel', 'warning',
+
+            '-rtsp_transport', 'tcp',
+            '-probesize', '500000',
+            '-analyzeduration', '1000000',
+            '-i', cameraRtspUrl,
+
+            '-map', '0:v:0',
+            '-vf', videoCrop,
+
+            '-frames:v', '1',
+            '-q:v', '3',
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            'pipe:1',
+        ];
+
+        this.console.log(`Refreshing snapshot: ${ffmpegPath} ${args.join(' ')}`);
+
+        const jpeg = await new Promise<Buffer>((resolve, reject) => {
+            const child = spawn(ffmpegPath, args);
+
+            const chunks: Buffer[] = [];
+            const errors: Buffer[] = [];
+
+            const timeout = setTimeout(() => {
+                try {
+                    child.kill('SIGKILL');
+                } catch {
+                    // ignore
+                }
+                reject(new Error('Snapshot ffmpeg timed out'));
+            }, 10000);
+
+            child.stdout.on('data', data => {
+                chunks.push(Buffer.from(data));
+            });
+
+            child.stderr.on('data', data => {
+                errors.push(Buffer.from(data));
+            });
+
+            child.on('error', error => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+
+            child.on('exit', code => {
+                clearTimeout(timeout);
+
+                const stderr = Buffer.concat(errors).toString();
+                const buffer = Buffer.concat(chunks);
+
+                if (code !== 0) {
+                    reject(new Error(`Snapshot ffmpeg exited with code ${code}: ${stderr}`));
+                    return;
+                }
+
+                if (!buffer.length) {
+                    reject(new Error(`Snapshot ffmpeg produced no output: ${stderr}`));
+                    return;
+                }
+
+                resolve(buffer);
+            });
+        });
+
+        fs.writeFileSync(this.snapshotCachePath, jpeg);
+        return jpeg;
+    }
+
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
-        return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        try {
+            // Gebruik de startup snapshot. Niet telkens opnieuw de camera wakker maken.
+            if (this.startupSnapshotPromise) {
+                try {
+                    await this.startupSnapshotPromise;
+                } catch {
+                    // fallback hieronder
+                }
+            }
+
+            if (fs.existsSync(this.snapshotCachePath)) {
+                return mediaManager.createMediaObject(
+                    fs.readFileSync(this.snapshotCachePath),
+                    'image/jpeg'
+                );
+            }
+
+            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        } catch (e) {
+            this.console.warn(`Failed to read cached snapshot, using fallback: ${e}`);
+            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        }
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
-        return;
+        return [
+            {
+                id: 'default',
+                name: 'Snapshot',
+                width: 1280,
+                height: 720,
+            } as PictureOptions,
+        ];
+    }
+
+    private getSnapshotRefreshSeconds(): number {
+        const value = Number(this.settingsStorage.values.snapshotRefreshSeconds || '10');
+
+        if (!Number.isFinite(value) || value <= 0) {
+            return 0;
+        }
+
+        // Niet te agressief. RTSP snapshot pakken is relatief duur.
+        return Math.max(2, Math.floor(value));
+    }
+
+    private async refreshSnapshotSafely(reason: string): Promise<void> {
+        if (this.snapshotRefreshRunning) {
+            this.console.log(`Snapshot refresh skipped, already running: ${reason}`);
+            return;
+        }
+
+        this.snapshotRefreshRunning = true;
+
+        try {
+            this.console.log(`Snapshot refresh started: ${reason}`);
+            await this.refreshSnapshot();
+            this.snapshotReady = true;
+            this.console.log(`Snapshot refresh ready: ${reason}`);
+        } catch (e) {
+            this.console.warn(`Snapshot refresh failed (${reason}): ${e}`);
+
+            if (!fs.existsSync(this.snapshotCachePath)) {
+                fs.writeFileSync(this.snapshotCachePath, dogImage);
+            }
+        } finally {
+            this.snapshotRefreshRunning = false;
+        }
+    }
+
+    private startSnapshotRefreshLoop(): void {
+        const refreshSeconds = this.getSnapshotRefreshSeconds();
+
+        if (refreshSeconds <= 0) {
+            this.console.log('Snapshot periodic refresh disabled.');
+            return;
+        }
+
+        if (!this.snapshotRefreshTimer) {
+            this.console.log(`Starting snapshot refresh loop every ${refreshSeconds}s`);
+
+            this.snapshotRefreshTimer = setInterval(() => {
+                this.refreshSnapshotSafely('periodic stream refresh');
+            }, refreshSeconds * 1000);
+        }
+
+        // Verleng de "lease" telkens wanneer een stream wordt gestart.
+        // Omdat Scrypted geen simpele stream-ended callback geeft, stoppen we
+        // de refresh-loop automatisch na een tijdje zonder nieuwe stream-start.
+        if (this.snapshotRefreshLeaseTimer) {
+            clearTimeout(this.snapshotRefreshLeaseTimer);
+        }
+
+        const leaseMs = Math.max(30000, refreshSeconds * 3000);
+
+        this.snapshotRefreshLeaseTimer = setTimeout(() => {
+            this.stopSnapshotRefreshLoop();
+        }, leaseMs);
+    }
+
+    private stopSnapshotRefreshLoop(): void {
+        if (this.snapshotRefreshTimer) {
+            clearInterval(this.snapshotRefreshTimer);
+            this.snapshotRefreshTimer = undefined;
+        }
+
+        if (this.snapshotRefreshLeaseTimer) {
+            clearTimeout(this.snapshotRefreshLeaseTimer);
+            this.snapshotRefreshLeaseTimer = undefined;
+        }
+
+        this.console.log('Stopped snapshot refresh loop');
     }
 
     async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {
         this.console.log(`getVideoStream requested: ${JSON.stringify(options)}`);
 
-        const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'people.mp4');
-        
-        // G.711 μ-law is used because live AAC/ADTS fails when Scrypted rebroadcasts to RTSP.
-        const session = `${Date.now()}-${this.streamGeneration}`;
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${session}`;
+        const videoMode = (this.settingsStorage.values.videoMode as string || 'live').trim();
+        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
+        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
 
-        this.console.log(`Using video file: ${file}`);
+        const videoFps = String(Number(this.settingsStorage.values.videoFps || '15') || 15);
+        const snapshotVideoFps = String(Number(this.settingsStorage.values.snapshotVideoFps || '2') || 2);
+
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
+
+        this.console.log(`Video mode: ${videoMode}`);
+        this.console.log(`Using camera RTSP URL: ${cameraRtspUrl || '(not configured)'}`);
+        this.console.log(`Using video crop: ${videoCrop}`);
         this.console.log(`Using mic URL: ${micUrl}`);
 
-        const ffmpegInput: FFmpegInput = {
-            inputArguments: [
+        const inputArguments: string[] = [];
+
+        if (videoMode === 'snapshot') {
+            
+            
+            if (!fs.existsSync(this.snapshotCachePath)) {
+                this.console.warn('No cached snapshot available, using fallback dog image.');
+                fs.writeFileSync(this.snapshotCachePath, dogImage);
+            }
+
+            this.startSnapshotRefreshLoop();
+
+            this.console.log(`Using periodically refreshed snapshot still video: ${this.snapshotCachePath}`);
+
+            inputArguments.push(
+                '-loop', '1',
+                '-framerate', snapshotVideoFps,
+                '-i', this.snapshotCachePath,
+            );
+        }
+        else if (cameraRtspUrl) {
+            // Live camera mode.
+            inputArguments.push(
+                '-thread_queue_size', '512',
+                '-rtsp_transport', 'tcp',
+                '-probesize', '500000',
+                '-analyzeduration', '1000000',
+                '-i', cameraRtspUrl,
+            );
+        }
+        else {
+            // Fallback dummy video.
+            const file = path.join(
+                process.env.SCRYPTED_PLUGIN_VOLUME,
+                'zip',
+                'unzipped',
+                'fs',
+                'people.mp4'
+            );
+
+            this.console.log(`No camera configured, using fallback video: ${file}`);
+
+            inputArguments.push(
                 '-re',
                 '-stream_loop', '-1',
                 '-i', file,
+            );
+        }
 
-                '-fflags', 'nobuffer',
-                '-flags', 'low_delay',
-                '-probesize', '32',
-                '-analyzeduration', '0',
-                '-f', 'mulaw',
-                '-ar', '8000',
-                '-ac', '1',
-                '-i', micUrl,
+        // Live Golmar/Pi audio.
+        inputArguments.push(
+            '-thread_queue_size', '512',
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', micUrl,
 
-                '-map', '0:v:0',
-                '-map', '1:a:0',
-            ],
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+        );
+
+        // In live camera mode, crop the live video.
+        // In snapshot mode, the JPEG is already cropped by refreshSnapshot().
+        if (videoMode !== 'snapshot' && cameraRtspUrl && videoCrop) {
+            inputArguments.push(
+                '-vf', videoCrop,
+            );
+        }
+
+        const ffmpegInput: FFmpegInput = {
+            inputArguments,
         };
+
+        if (videoMode === 'snapshot') {
+            const fpsNumber = Number(snapshotVideoFps) || 2;
+
+            ffmpegInput.h264EncoderArguments = [
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+
+                '-profile:v', 'main',
+                '-level:v', '3.1',
+                '-pix_fmt', 'yuv420p',
+
+                '-r', String(fpsNumber),
+                '-g', String(fpsNumber),
+                '-keyint_min', String(fpsNumber),
+                '-sc_threshold', '0',
+                '-bf', '0',
+
+                //// Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
+                //'-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0:tune=zerolatency',
+
+                // Stilstaand beeld heeft weinig bitrate nodig.
+                '-b:v', '150k',
+                '-maxrate', '150k',
+                '-bufsize', '300k',
+            ];
+        }
+        else if (cameraRtspUrl) {
+            const fpsNumber = Number(videoFps) || 15;
+
+            ffmpegInput.h264EncoderArguments = [
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+
+                '-profile:v', 'main',
+                '-level:v', '3.1',
+                '-pix_fmt', 'yuv420p',
+
+                '-r', String(fpsNumber),
+                '-g', String(fpsNumber),
+                '-keyint_min', String(fpsNumber),
+                '-sc_threshold', '0',
+                '-bf', '0',
+                '-force_key_frames', 'expr:gte(t,n_forced*1)',
+
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
+
+                '-b:v', '280k',
+                '-maxrate', '280k',
+                '-bufsize', '560k',
+            ];
+        }
 
         return mediaManager.createMediaObject(
             Buffer.from(JSON.stringify(ffmpegInput)),
@@ -126,14 +501,21 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const width = Number(this.settingsStorage.values.videoWidth || '1280');
+        const height = Number(this.settingsStorage.values.videoHeight || '720');
+        const fps = Number(this.settingsStorage.values.videoFps || '15');
+
         return [{
             id: 'stream',
             name: 'Golmar Stream',
-            video: {
-                codec: 'h264',
-            },
             audio: {
                 codec: 'pcm_mulaw',
+            },
+            video: {
+                codec: 'h264',
+                width,
+                height,
+                fps,
             }
         }];
     }

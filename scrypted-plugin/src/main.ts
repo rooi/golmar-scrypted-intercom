@@ -228,7 +228,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             });
         });
 
-        fs.writeFileSync(this.snapshotCachePath, jpeg);
+        const tmpPath = `${this.snapshotCachePath}.tmp`;
+        fs.writeFileSync(tmpPath, jpeg);
+        fs.renameSync(tmpPath, this.snapshotCachePath);
         return jpeg;
     }
 
@@ -357,7 +359,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const videoFps = String(Number(this.settingsStorage.values.videoFps || '15') || 15);
         const snapshotVideoFps = String(Number(this.settingsStorage.values.snapshotVideoFps || '2') || 2);
 
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
+        const session = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${encodeURIComponent(session)}`;
 
         this.console.log(`Video mode: ${videoMode}`);
         this.console.log(`Using camera RTSP URL: ${cameraRtspUrl || '(not configured)'}`);
@@ -379,6 +382,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             this.console.log(`Using periodically refreshed snapshot still video: ${this.snapshotCachePath}`);
 
             inputArguments.push(
+                '-re',
                 '-loop', '1',
                 '-framerate', snapshotVideoFps,
                 '-i', this.snapshotCachePath,
@@ -387,7 +391,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         else if (cameraRtspUrl) {
             // Live camera mode.
             inputArguments.push(
-                '-thread_queue_size', '512',
+                '-thread_queue_size', '8',
                 '-rtsp_transport', 'tcp',
                 '-probesize', '500000',
                 '-analyzeduration', '1000000',
@@ -415,9 +419,11 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         // Live Golmar/Pi audio.
         inputArguments.push(
-            '-thread_queue_size', '512',
+            '-thread_queue_size', '8',
             '-fflags', 'nobuffer',
             '-flags', 'low_delay',
+            //'-avioflags', 'direct',
+            '-use_wallclock_as_timestamps', '1',
             '-probesize', '32',
             '-analyzeduration', '0',
             '-f', 'mulaw',
@@ -437,6 +443,10 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             );
         }
 
+        const fpsNumberForOptions = videoMode === 'snapshot'
+            ? Number(snapshotVideoFps) || 5
+            : Number(videoFps) || 15;
+
         const ffmpegInput: FFmpegInput = {
             inputArguments,
         };
@@ -446,7 +456,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
             ffmpegInput.h264EncoderArguments = [
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
 
                 '-profile:v', 'main',
                 '-level:v', '3.1',
@@ -460,12 +471,16 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
                 //// Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
                 //'-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
-                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0:tune=zerolatency',
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0',
 
                 // Stilstaand beeld heeft weinig bitrate nodig.
-                '-b:v', '150k',
-                '-maxrate', '150k',
-                '-bufsize', '300k',
+                '-b:v', '120k',
+                '-maxrate', '120k',
+                '-bufsize', '60k',
+
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-flush_packets', '1',
             ];
         }
         else if (cameraRtspUrl) {
@@ -501,9 +516,13 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const videoMode = (this.settingsStorage.values.videoMode as string || 'live').trim();
+
         const width = Number(this.settingsStorage.values.videoWidth || '1280');
         const height = Number(this.settingsStorage.values.videoHeight || '720');
-        const fps = Number(this.settingsStorage.values.videoFps || '15');
+        const fps = videoMode === 'snapshot'
+        ? Number(this.settingsStorage.values.snapshotVideoFps || '5') || 5
+        : Number(this.settingsStorage.values.videoFps || '15') || 15;
 
         return [{
             id: 'stream',
@@ -549,11 +568,23 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             typeof arg === 'string' && arg.startsWith('rtsp://')
         );
 
-        if (rtspUrlIndex >= 0 && !inputArguments.includes('-rtsp_transport')) {
+        if (rtspUrlIndex >= 0) {
             const inputFlagIndex = inputArguments.lastIndexOf('-i', rtspUrlIndex);
 
             if (inputFlagIndex >= 0) {
-                inputArguments.splice(inputFlagIndex, 0, '-rtsp_transport', 'tcp');
+                const lowLatencyInputArgs = [
+                    '-fflags', 'nobuffer',
+                    '-flags', 'low_delay',
+                    '-probesize', '32',
+                    '-analyzeduration', '0',
+                    '-thread_queue_size', '8',
+                ];
+
+                if (!inputArguments.includes('-rtsp_transport')) {
+                    lowLatencyInputArgs.push('-rtsp_transport', 'tcp');
+                }
+
+                inputArguments.splice(inputFlagIndex, 0, ...lowLatencyInputArgs);
             }
         }
 

@@ -106,11 +106,97 @@ settingsStorage = new StorageSettings(this, {
     }
 
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
-        return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
+        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
+
+        // Fallback: keep old dog image if no camera RTSP URL is configured.
+        if (!cameraRtspUrl) {
+            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        }
+
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+
+        const args = [
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-rtsp_transport', 'tcp',
+            '-probesize', '500000',
+            '-analyzeduration', '1000000',
+            '-i', cameraRtspUrl,
+
+            '-map', '0:v:0',
+            '-vf', videoCrop,
+
+            '-frames:v', '1',
+            '-q:v', '3',
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            'pipe:1',
+        ];
+
+        this.console.log(`Taking snapshot ffmpeg: ${ffmpegPath} ${args.join(' ')}`);
+
+        const jpeg = await new Promise<Buffer>((resolve, reject) => {
+            const child = spawn(ffmpegPath, args);
+
+            const chunks: Buffer[] = [];
+            const errors: Buffer[] = [];
+
+            const timeout = setTimeout(() => {
+                try {
+                    child.kill('SIGKILL');
+                } catch {
+                    // ignore
+                }
+                reject(new Error('Snapshot ffmpeg timed out'));
+            }, 10000);
+
+            child.stdout.on('data', data => {
+                chunks.push(Buffer.from(data));
+            });
+
+            child.stderr.on('data', data => {
+                errors.push(Buffer.from(data));
+            });
+
+            child.on('error', error => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+
+            child.on('exit', code => {
+                clearTimeout(timeout);
+
+                const stderr = Buffer.concat(errors).toString();
+
+                if (code !== 0) {
+                    reject(new Error(`Snapshot ffmpeg exited with code ${code}: ${stderr}`));
+                    return;
+                }
+
+                const buffer = Buffer.concat(chunks);
+
+                if (!buffer.length) {
+                    reject(new Error(`Snapshot ffmpeg produced no JPEG output: ${stderr}`));
+                    return;
+                }
+
+                resolve(buffer);
+            });
+        });
+
+        return mediaManager.createMediaObject(jpeg, 'image/jpeg');
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
-        return;
+        return [
+            {
+                id: 'default',
+                name: 'Snapshot',
+                width: 1280,
+                height: 720,
+            } as PictureOptions,
+        ];
     }
 
     async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {

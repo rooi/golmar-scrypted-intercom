@@ -44,18 +44,44 @@ type PendingWsCommand = {
 };
 
 class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Settings {
-    settingsStorage = new StorageSettings(this, {
-        piBaseUrl: {
-            title: 'Pi Agent Base URL',
-            description: 'Example: http://192.168.1.123:8765',
-            defaultValue: 'http://192.168.1.123:8765',
-        },
-        piWsUrl: {
-            title: 'Pi Agent WebSocket URL',
-            description: 'Example: ws://10.0.1.41:8766',
-            defaultValue: 'ws://10.0.1.41:8766',
-        },
-    });
+settingsStorage = new StorageSettings(this, {
+    piBaseUrl: {
+        title: 'Pi Agent Base URL',
+        description: 'Example: http://192.168.1.123:8765',
+        defaultValue: 'http://192.168.1.123:8765',
+    },
+    piWsUrl: {
+        title: 'Pi Agent WebSocket URL',
+        description: 'Example: ws://10.0.1.41:8766',
+        defaultValue: 'ws://10.0.1.41:8766',
+    },
+
+    cameraRtspUrl: {
+        title: 'Camera RTSP URL',
+        description: 'RTSP video source for the Golmar stream. Example: rtsp://10.0.1.10:42967/dc86fcd4ddbb673b',
+        defaultValue: '',
+    },
+    videoCrop: {
+        title: 'Video Crop',
+        description: 'FFmpeg crop filter. Example: crop=1280:720:1280:720',
+        defaultValue: 'crop=1280:720:1280:720',
+    },
+    videoWidth: {
+        title: 'Video Width',
+        description: 'Advertised video width for Scrypted/HomeKit.',
+        defaultValue: '1280',
+    },
+    videoHeight: {
+        title: 'Video Height',
+        description: 'Advertised video height for Scrypted/HomeKit.',
+        defaultValue: '720',
+    },
+    videoFps: {
+        title: 'Video FPS',
+        description: 'Advertised frame rate for Scrypted/HomeKit.',
+        defaultValue: '15',
+    },
+});
 
     private piWs: any;
     private piWsConnected = false;
@@ -90,34 +116,108 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {
         this.console.log(`getVideoStream requested: ${JSON.stringify(options)}`);
 
-        const file = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'zip', 'unzipped', 'fs', 'people.mp4');
-        
-        // G.711 μ-law is used because live AAC/ADTS fails when Scrypted rebroadcasts to RTSP.
-        const session = `${Date.now()}-${this.streamGeneration}`;
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${session}`;
+        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
+        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1224:720').trim();
+        const videoFps = (this.settingsStorage.values.videoFps as string || '15').trim();
 
-        this.console.log(`Using video file: ${file}`);
-        this.console.log(`Using mic URL: ${micUrl}`);
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
 
-        const ffmpegInput: FFmpegInput = {
-            inputArguments: [
+        const inputArguments: string[] = [];
+
+        if (cameraRtspUrl) {
+            this.console.log(`Using camera RTSP URL: ${cameraRtspUrl}`);
+            this.console.log(`Using video crop: ${videoCrop}`);
+
+            inputArguments.push(
+                '-thread_queue_size', '512',
+                '-rtsp_transport', 'tcp',
+
+                // Niet te agressief bij HEVC input; HomeKit heeft een schone start nodig.
+                '-probesize', '500000',
+                '-analyzeduration', '1000000',
+
+                '-i', cameraRtspUrl,
+            );
+        }
+        else {
+            const file = path.join(
+                process.env.SCRYPTED_PLUGIN_VOLUME,
+                'zip',
+                'unzipped',
+                'fs',
+                'people.mp4'
+            );
+
+            this.console.log(`No Camera RTSP URL configured, using dummy video: ${file}`);
+
+            inputArguments.push(
+                // Fallback video input: bundled dummy video.
                 '-re',
                 '-stream_loop', '-1',
                 '-i', file,
+            );
+        }
 
-                '-fflags', 'nobuffer',
-                '-flags', 'low_delay',
-                '-probesize', '32',
-                '-analyzeduration', '0',
-                '-f', 'mulaw',
-                '-ar', '8000',
-                '-ac', '1',
-                '-i', micUrl,
+        inputArguments.push(
+            // Audio input: Pi agent mic stream.
+            '-thread_queue_size', '512',
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-f', 'mulaw',
+            '-ar', '8000',
+            '-ac', '1',
+            '-i', micUrl,
 
-                '-map', '0:v:0',
-                '-map', '1:a:0',
-            ],
+            // Select video from input 0 and audio from input 1.
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+        );
+
+        if (cameraRtspUrl && videoCrop) {
+            inputArguments.push(
+                '-vf', videoCrop,
+            );
+        }
+
+        const ffmpegInput: FFmpegInput = {
+            inputArguments,
         };
+
+        if (cameraRtspUrl) {
+            const fpsNumber = Number(videoFps) || 15;
+
+            if (cameraRtspUrl) {
+                const fpsNumber = Number(videoFps) || 15;
+
+                ffmpegInput.h264EncoderArguments = [
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    //'-tune', 'zerolatency',
+
+                    '-profile:v', 'main',
+                    '-level:v', '3.1',
+                    '-pix_fmt', 'yuv420p',
+
+                    '-r', String(fpsNumber),
+                    '-g', String(fpsNumber),
+                    '-keyint_min', String(fpsNumber),
+                    '-sc_threshold', '0',
+                    '-bf', '0',
+
+                    // Expliciet keyframes forceren voor HomeKit/RTCP PLI.
+                    '-force_key_frames', 'expr:gte(t,n_forced*1)',
+
+                    // SPS/PPS bij keyframes herhalen.
+                    '-x264-params', 'repeat-headers=1:aud=1',
+
+                    '-b:v', '280k',
+                    '-maxrate', '280k',
+                    '-bufsize', '560k',
+                ];
+            }
+        }
 
         return mediaManager.createMediaObject(
             Buffer.from(JSON.stringify(ffmpegInput)),
@@ -126,14 +226,21 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const width = Number(this.settingsStorage.values.videoWidth || '1280');
+        const height = Number(this.settingsStorage.values.videoHeight || '720');
+        const fps = Number(this.settingsStorage.values.videoFps || '15');
+
         return [{
             id: 'stream',
             name: 'Golmar Stream',
-            video: {
-                codec: 'h264',
-            },
             audio: {
                 codec: 'pcm_mulaw',
+            },
+            video: {
+                codec: 'h264',
+                width,
+                height,
+                fps,
             }
         }];
     }

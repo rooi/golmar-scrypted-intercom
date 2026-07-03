@@ -391,10 +391,10 @@ def mic_ulaw():
             "-analyzeduration", "0",
 
             "-f", "alsa",
+            "-thread_queue_size", "8",
             "-sample_fmt", "s16",
             "-ac", "2",
             "-ar", "44100",
-            "-thread_queue_size", "8",
             "-i", "plughw:1,0",
 
             "-vn",

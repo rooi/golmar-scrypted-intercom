@@ -171,6 +171,8 @@ def speaker_raw():
             "-f", "S16_LE",
             "-r", SPEAKER_RATE,
             "-c", SPEAKER_CHANNELS,
+            "--buffer-time=80000",
+            "--period-time=20000",
         ], stdin=subprocess.PIPE)
 
         while True:
@@ -408,7 +410,7 @@ def mic_ulaw():
 
         try:
             while True:
-                chunk = process.stdout.read(1024)
+                chunk = process.stdout.read(160)
                 if not chunk:
                     break
                 yield chunk

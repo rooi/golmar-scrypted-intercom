@@ -28,6 +28,7 @@ import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import fs from 'fs';
 import path from 'path';
+import { createServer, Server, ServerResponse } from 'http';
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
@@ -44,44 +45,57 @@ type PendingWsCommand = {
 };
 
 class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Settings {
-settingsStorage = new StorageSettings(this, {
-    piBaseUrl: {
-        title: 'Pi Agent Base URL',
-        description: 'Example: http://192.168.1.123:8765',
-        defaultValue: 'http://192.168.1.123:8765',
-    },
-    piWsUrl: {
-        title: 'Pi Agent WebSocket URL',
-        description: 'Example: ws://10.0.1.41:8766',
-        defaultValue: 'ws://10.0.1.41:8766',
-    },
+    settingsStorage = new StorageSettings(this, {
+        piBaseUrl: {
+            title: 'Pi Agent Base URL',
+            description: 'Example: http://192.168.1.123:8765',
+            defaultValue: 'http://192.168.1.123:8765',
+        },
+        piWsUrl: {
+            title: 'Pi Agent WebSocket URL',
+            description: 'Example: ws://10.0.1.41:8766',
+            defaultValue: 'ws://10.0.1.41:8766',
+        },
 
-    cameraRtspUrl: {
-        title: 'Camera RTSP URL',
-        description: 'RTSP video source for the Golmar stream. Example: rtsp://10.0.1.10:42967/dc86fcd4ddbb673b',
-        defaultValue: '',
-    },
-    videoCrop: {
-        title: 'Video Crop',
-        description: 'FFmpeg crop filter. Example: crop=1280:720:1280:720',
-        defaultValue: 'crop=1280:720:1280:720',
-    },
-    videoWidth: {
-        title: 'Video Width',
-        description: 'Advertised video width for Scrypted/HomeKit.',
-        defaultValue: '1280',
-    },
-    videoHeight: {
-        title: 'Video Height',
-        description: 'Advertised video height for Scrypted/HomeKit.',
-        defaultValue: '720',
-    },
-    videoFps: {
-        title: 'Video FPS',
-        description: 'Advertised frame rate for Scrypted/HomeKit.',
-        defaultValue: '15',
-    },
-});
+        videoMode: {
+            title: 'Video Mode',
+            description: 'live = live RTSP video. snapshot = still image video with live audio.',
+            choices: ['live', 'snapshot'],
+            defaultValue: 'live',
+        },
+        cameraRtspUrl: {
+            title: 'Camera RTSP URL',
+            description: 'RTSP source for live video and snapshots.',
+            defaultValue: '',
+        },
+        videoCrop: {
+            title: 'Video Crop',
+            description: 'FFmpeg video filter for crop/snapshot. Example: crop=1280:720:1280:720',
+            defaultValue: 'crop=1280:720:1280:720',
+        },
+        videoWidth: {
+            title: 'Video Width',
+            defaultValue: '1280',
+        },
+        videoHeight: {
+            title: 'Video Height',
+            defaultValue: '720',
+        },
+        videoFps: {
+            title: 'Video FPS',
+            defaultValue: '15',
+        },
+        snapshotVideoFps: {
+            title: 'Snapshot Video FPS',
+            description: 'FPS for still-image video mode. 1 to 5 is usually enough.',
+            defaultValue: '2',
+        },
+        snapshotRefreshSeconds: {
+            title: 'Snapshot Refresh Seconds',
+            description: 'How often to refresh the still image while a snapshot video stream is active. Set 0 to disable.',
+            defaultValue: '10',
+        },
+    });
 
     private piWs: any;
     private piWsConnected = false;
@@ -91,13 +105,43 @@ settingsStorage = new StorageSettings(this, {
 
     private intercomProcess?: ChildProcessWithoutNullStreams;
 
+    private snapshotCachePath = path.join(
+        process.env.SCRYPTED_PLUGIN_VOLUME || '/tmp',
+        'golmar-snapshot.jpg'
+    );
+
     private streamGeneration = 0;
+
+    private startupSnapshotPromise?: Promise<void>;
+    private snapshotReady = false;
+
+    private snapshotRefreshTimer?: any;
+    private snapshotRefreshRunning = false;
+    private snapshotRefreshLeaseTimer?: any;
 
     constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
         super(nativeId);
 
         // Start iets later zodat Scrypted/device init rustig klaar is.
         setTimeout(() => this.connectPiWebSocket(), 1000);
+
+        // Maak één snapshot bij opstarten. Daarna hergebruiken.
+        setTimeout(() => {
+            this.startupSnapshotPromise = this.refreshSnapshot()
+                .then(() => {
+                    this.snapshotReady = true;
+                    this.console.log(`Startup snapshot ready: ${this.snapshotCachePath}`);
+                })
+                .catch(e => {
+                    this.console.warn(`Startup snapshot failed, using fallback later: ${e}`);
+
+                    if (!fs.existsSync(this.snapshotCachePath)) {
+                        fs.writeFileSync(this.snapshotCachePath, dogImage);
+                    }
+
+                    this.snapshotReady = false;
+                });
+        }, 2000);
     }
 
     private bumpStreamGeneration(reason: string) {
@@ -105,13 +149,13 @@ settingsStorage = new StorageSettings(this, {
         this.console.log(`Stream generation bumped to ${this.streamGeneration}: ${reason}`);
     }
 
-    async takePicture(options?: PictureOptions): Promise<MediaObject> {
+    async refreshSnapshot(): Promise<Buffer> {
         const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
         const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
 
-        // Fallback: keep old dog image if no camera RTSP URL is configured.
         if (!cameraRtspUrl) {
-            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+            fs.writeFileSync(this.snapshotCachePath, dogImage);
+            return dogImage;
         }
 
         const ffmpegPath = await mediaManager.getFFmpegPath();
@@ -119,6 +163,7 @@ settingsStorage = new StorageSettings(this, {
         const args = [
             '-hide_banner',
             '-loglevel', 'warning',
+
             '-rtsp_transport', 'tcp',
             '-probesize', '500000',
             '-analyzeduration', '1000000',
@@ -134,7 +179,7 @@ settingsStorage = new StorageSettings(this, {
             'pipe:1',
         ];
 
-        this.console.log(`Taking snapshot ffmpeg: ${ffmpegPath} ${args.join(' ')}`);
+        this.console.log(`Refreshing snapshot: ${ffmpegPath} ${args.join(' ')}`);
 
         const jpeg = await new Promise<Buffer>((resolve, reject) => {
             const child = spawn(ffmpegPath, args);
@@ -168,16 +213,15 @@ settingsStorage = new StorageSettings(this, {
                 clearTimeout(timeout);
 
                 const stderr = Buffer.concat(errors).toString();
+                const buffer = Buffer.concat(chunks);
 
                 if (code !== 0) {
                     reject(new Error(`Snapshot ffmpeg exited with code ${code}: ${stderr}`));
                     return;
                 }
 
-                const buffer = Buffer.concat(chunks);
-
                 if (!buffer.length) {
-                    reject(new Error(`Snapshot ffmpeg produced no JPEG output: ${stderr}`));
+                    reject(new Error(`Snapshot ffmpeg produced no output: ${stderr}`));
                     return;
                 }
 
@@ -185,7 +229,33 @@ settingsStorage = new StorageSettings(this, {
             });
         });
 
-        return mediaManager.createMediaObject(jpeg, 'image/jpeg');
+        fs.writeFileSync(this.snapshotCachePath, jpeg);
+        return jpeg;
+    }
+
+    async takePicture(options?: PictureOptions): Promise<MediaObject> {
+        try {
+            // Gebruik de startup snapshot. Niet telkens opnieuw de camera wakker maken.
+            if (this.startupSnapshotPromise) {
+                try {
+                    await this.startupSnapshotPromise;
+                } catch {
+                    // fallback hieronder
+                }
+            }
+
+            if (fs.existsSync(this.snapshotCachePath)) {
+                return mediaManager.createMediaObject(
+                    fs.readFileSync(this.snapshotCachePath),
+                    'image/jpeg'
+                );
+            }
+
+            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        } catch (e) {
+            this.console.warn(`Failed to read cached snapshot, using fallback: ${e}`);
+            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+        }
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
@@ -199,33 +269,136 @@ settingsStorage = new StorageSettings(this, {
         ];
     }
 
+    private getSnapshotRefreshSeconds(): number {
+        const value = Number(this.settingsStorage.values.snapshotRefreshSeconds || '10');
+
+        if (!Number.isFinite(value) || value <= 0) {
+            return 0;
+        }
+
+        // Niet te agressief. RTSP snapshot pakken is relatief duur.
+        return Math.max(2, Math.floor(value));
+    }
+
+    private async refreshSnapshotSafely(reason: string): Promise<void> {
+        if (this.snapshotRefreshRunning) {
+            this.console.log(`Snapshot refresh skipped, already running: ${reason}`);
+            return;
+        }
+
+        this.snapshotRefreshRunning = true;
+
+        try {
+            this.console.log(`Snapshot refresh started: ${reason}`);
+            await this.refreshSnapshot();
+            this.snapshotReady = true;
+            this.console.log(`Snapshot refresh ready: ${reason}`);
+        } catch (e) {
+            this.console.warn(`Snapshot refresh failed (${reason}): ${e}`);
+
+            if (!fs.existsSync(this.snapshotCachePath)) {
+                fs.writeFileSync(this.snapshotCachePath, dogImage);
+            }
+        } finally {
+            this.snapshotRefreshRunning = false;
+        }
+    }
+
+    private startSnapshotRefreshLoop(): void {
+        const refreshSeconds = this.getSnapshotRefreshSeconds();
+
+        if (refreshSeconds <= 0) {
+            this.console.log('Snapshot periodic refresh disabled.');
+            return;
+        }
+
+        if (!this.snapshotRefreshTimer) {
+            this.console.log(`Starting snapshot refresh loop every ${refreshSeconds}s`);
+
+            this.snapshotRefreshTimer = setInterval(() => {
+                this.refreshSnapshotSafely('periodic stream refresh');
+            }, refreshSeconds * 1000);
+        }
+
+        // Verleng de "lease" telkens wanneer een stream wordt gestart.
+        // Omdat Scrypted geen simpele stream-ended callback geeft, stoppen we
+        // de refresh-loop automatisch na een tijdje zonder nieuwe stream-start.
+        if (this.snapshotRefreshLeaseTimer) {
+            clearTimeout(this.snapshotRefreshLeaseTimer);
+        }
+
+        const leaseMs = Math.max(30000, refreshSeconds * 3000);
+
+        this.snapshotRefreshLeaseTimer = setTimeout(() => {
+            this.stopSnapshotRefreshLoop();
+        }, leaseMs);
+    }
+
+    private stopSnapshotRefreshLoop(): void {
+        if (this.snapshotRefreshTimer) {
+            clearInterval(this.snapshotRefreshTimer);
+            this.snapshotRefreshTimer = undefined;
+        }
+
+        if (this.snapshotRefreshLeaseTimer) {
+            clearTimeout(this.snapshotRefreshLeaseTimer);
+            this.snapshotRefreshLeaseTimer = undefined;
+        }
+
+        this.console.log('Stopped snapshot refresh loop');
+    }
+
     async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {
         this.console.log(`getVideoStream requested: ${JSON.stringify(options)}`);
 
+        const videoMode = (this.settingsStorage.values.videoMode as string || 'live').trim();
         const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
-        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1224:720').trim();
-        const videoFps = (this.settingsStorage.values.videoFps as string || '15').trim();
+        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
+
+        const videoFps = String(Number(this.settingsStorage.values.videoFps || '15') || 15);
+        const snapshotVideoFps = String(Number(this.settingsStorage.values.snapshotVideoFps || '2') || 2);
 
         const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
 
+        this.console.log(`Video mode: ${videoMode}`);
+        this.console.log(`Using camera RTSP URL: ${cameraRtspUrl || '(not configured)'}`);
+        this.console.log(`Using video crop: ${videoCrop}`);
+        this.console.log(`Using mic URL: ${micUrl}`);
+
         const inputArguments: string[] = [];
 
-        if (cameraRtspUrl) {
-            this.console.log(`Using camera RTSP URL: ${cameraRtspUrl}`);
-            this.console.log(`Using video crop: ${videoCrop}`);
+        if (videoMode === 'snapshot') {
+            // Bij stream-start meteen een verse snapshot proberen.
+            // Audio blijft ondertussen gewoon de Pi mic stream.
+            await this.refreshSnapshotSafely('stream start');
 
+            if (!fs.existsSync(this.snapshotCachePath)) {
+                this.console.warn('No cached snapshot available, using fallback dog image.');
+                fs.writeFileSync(this.snapshotCachePath, dogImage);
+            }
+
+            this.startSnapshotRefreshLoop();
+
+            this.console.log(`Using periodically refreshed snapshot still video: ${this.snapshotCachePath}`);
+
+            inputArguments.push(
+                '-loop', '1',
+                '-framerate', snapshotVideoFps,
+                '-i', this.snapshotCachePath,
+            );
+        }
+        else if (cameraRtspUrl) {
+            // Live camera mode.
             inputArguments.push(
                 '-thread_queue_size', '512',
                 '-rtsp_transport', 'tcp',
-
-                // Niet te agressief bij HEVC input; HomeKit heeft een schone start nodig.
                 '-probesize', '500000',
                 '-analyzeduration', '1000000',
-
                 '-i', cameraRtspUrl,
             );
         }
         else {
+            // Fallback dummy video.
             const file = path.join(
                 process.env.SCRYPTED_PLUGIN_VOLUME,
                 'zip',
@@ -234,18 +407,17 @@ settingsStorage = new StorageSettings(this, {
                 'people.mp4'
             );
 
-            this.console.log(`No Camera RTSP URL configured, using dummy video: ${file}`);
+            this.console.log(`No camera configured, using fallback video: ${file}`);
 
             inputArguments.push(
-                // Fallback video input: bundled dummy video.
                 '-re',
                 '-stream_loop', '-1',
                 '-i', file,
             );
         }
 
+        // Live Golmar/Pi audio.
         inputArguments.push(
-            // Audio input: Pi agent mic stream.
             '-thread_queue_size', '512',
             '-fflags', 'nobuffer',
             '-flags', 'low_delay',
@@ -256,12 +428,13 @@ settingsStorage = new StorageSettings(this, {
             '-ac', '1',
             '-i', micUrl,
 
-            // Select video from input 0 and audio from input 1.
             '-map', '0:v:0',
             '-map', '1:a:0',
         );
 
-        if (cameraRtspUrl && videoCrop) {
+        // In live camera mode, crop the live video.
+        // In snapshot mode, the JPEG is already cropped by refreshSnapshot().
+        if (videoMode !== 'snapshot' && cameraRtspUrl && videoCrop) {
             inputArguments.push(
                 '-vf', videoCrop,
             );
@@ -271,38 +444,56 @@ settingsStorage = new StorageSettings(this, {
             inputArguments,
         };
 
-        if (cameraRtspUrl) {
+        if (videoMode === 'snapshot') {
+            const fpsNumber = Number(snapshotVideoFps) || 2;
+
+            ffmpegInput.h264EncoderArguments = [
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+
+                '-profile:v', 'main',
+                '-level:v', '3.1',
+                '-pix_fmt', 'yuv420p',
+
+                '-r', String(fpsNumber),
+                '-g', String(fpsNumber),
+                '-keyint_min', String(fpsNumber),
+                '-sc_threshold', '0',
+                '-bf', '0',
+
+                // Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
+
+                // Stilstaand beeld heeft weinig bitrate nodig.
+                '-b:v', '150k',
+                '-maxrate', '150k',
+                '-bufsize', '300k',
+            ];
+        }
+        else if (cameraRtspUrl) {
             const fpsNumber = Number(videoFps) || 15;
 
-            if (cameraRtspUrl) {
-                const fpsNumber = Number(videoFps) || 15;
+            ffmpegInput.h264EncoderArguments = [
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
 
-                ffmpegInput.h264EncoderArguments = [
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    //'-tune', 'zerolatency',
+                '-profile:v', 'main',
+                '-level:v', '3.1',
+                '-pix_fmt', 'yuv420p',
 
-                    '-profile:v', 'main',
-                    '-level:v', '3.1',
-                    '-pix_fmt', 'yuv420p',
+                '-r', String(fpsNumber),
+                '-g', String(fpsNumber),
+                '-keyint_min', String(fpsNumber),
+                '-sc_threshold', '0',
+                '-bf', '0',
+                '-force_key_frames', 'expr:gte(t,n_forced*1)',
 
-                    '-r', String(fpsNumber),
-                    '-g', String(fpsNumber),
-                    '-keyint_min', String(fpsNumber),
-                    '-sc_threshold', '0',
-                    '-bf', '0',
+                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
 
-                    // Expliciet keyframes forceren voor HomeKit/RTCP PLI.
-                    '-force_key_frames', 'expr:gte(t,n_forced*1)',
-
-                    // SPS/PPS bij keyframes herhalen.
-                    '-x264-params', 'repeat-headers=1:aud=1',
-
-                    '-b:v', '280k',
-                    '-maxrate', '280k',
-                    '-bufsize', '560k',
-                ];
-            }
+                '-b:v', '280k',
+                '-maxrate', '280k',
+                '-bufsize', '560k',
+            ];
         }
 
         return mediaManager.createMediaObject(

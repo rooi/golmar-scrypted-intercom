@@ -957,7 +957,7 @@ def read_doorbell_loop(loop):
 
 def run_http():
     print(f"HTTP listening on {HTTP_PORT}", flush=True)
-    app.run(host="0.0.0.0", port=HTTP_PORT)
+    app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
 
 
 async def main():

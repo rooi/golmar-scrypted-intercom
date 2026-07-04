@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import threading
 import time
@@ -65,7 +66,13 @@ def unlock_http():
 
 
 def unlock_door():
-    """Open deur via Automation HAT output one."""
+    """
+    Open deur via Automation HAT output one.
+
+    Het unlock-geluid wordt daarna in een aparte daemon-thread gestart,
+    zodat een ontbrekend/kapot audiobestand de unlock-call niet vertraagt
+    of vast laat lopen.
+    """
     with unlock_lock:
         print("Activating Automation HAT output one", flush=True)
         subprocess.run([
@@ -79,6 +86,10 @@ def unlock_door():
             )
         ], check=True, timeout=3)
         print("Automation HAT output one off", flush=True)
+
+    # Niet blokkeren op audio. Als het bestand ontbreekt, ffmpeg/aplay faalt,
+    # of talkback actief is, wordt het geluid alleen gelogd/geskipt.
+    threading.Thread(target=play_unlock_sound, daemon=True).start()
 
 
 SPEAKER_DEVICE = "plughw:1,0"
@@ -95,8 +106,20 @@ MIC_OUTPUT_CHANNELS = "1"
 AUDIO_RELAY_ENABLED = False
 AUDIO_RELAY_SETTLE_SECONDS = 0.10
 
+# Audiobestand dat na een unlock afgespeeld wordt.
+# Pas dit pad aan naar jouw bestand. ffmpeg mag wav/mp3/m4a/etc. lezen.
+UNLOCK_SOUND_ENABLED = True
+UNLOCK_SOUND_FILE = "/home/pi/golmar-scrypted-intercom/pi-agent/audio/unlock.wav"
+UNLOCK_SOUND_VOLUME = "1.0"
+UNLOCK_SOUND_TIMEOUT_SECONDS = 5
+
 audio_relay_lock = threading.Lock()
 audio_relay_users = 0
+
+# Houd bij of HomeKit/Safari op dit moment audio naar de Golmar stuurt.
+# Als talkback actief is, slaan we het unlock-geluid over om de stream niet te verstoren.
+speaker_stream_lock = threading.Lock()
+speaker_stream_active = False
 
 
 def set_audio_relay(enabled: bool):
@@ -150,9 +173,117 @@ def audio_relay_release():
             except Exception as e:
                 print("Audio relay off failed:", e, flush=True)
 
+def play_unlock_sound():
+    """
+    Speel een audiobestand af bij unlock zonder de unlock-call te blokkeren.
+
+    Veiligheidskeuzes:
+    - ontbrekend bestand: direct skippen
+    - actieve talkback-stream: direct skippen
+    - ffmpeg/aplay-fout: alleen loggen
+    - hangende playback: timeout en kill
+    """
+    if not UNLOCK_SOUND_ENABLED:
+        return
+
+    if not UNLOCK_SOUND_FILE or not os.path.isfile(UNLOCK_SOUND_FILE):
+        print(f"Unlock sound skipped: file not found: {UNLOCK_SOUND_FILE}", flush=True)
+        return
+
+    with speaker_stream_lock:
+        if speaker_stream_active:
+            print("Unlock sound skipped: speaker/talkback stream active", flush=True)
+            return
+
+    ffmpeg = None
+    aplay = None
+    relay_acquired = False
+
+    try:
+        print(f"Playing unlock sound: {UNLOCK_SOUND_FILE}", flush=True)
+
+        audio_relay_acquire()
+        relay_acquired = True
+
+        ffmpeg = subprocess.Popen([
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-i", UNLOCK_SOUND_FILE,
+            "-vn",
+            "-af", f"volume={UNLOCK_SOUND_VOLUME}",
+            "-acodec", "pcm_s16le",
+            "-ac", SPEAKER_CHANNELS,
+            "-ar", SPEAKER_RATE,
+            "-f", "s16le",
+            "pipe:1",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        aplay = subprocess.Popen([
+            "aplay",
+            "-D", SPEAKER_DEVICE,
+            "-f", "S16_LE",
+            "-r", SPEAKER_RATE,
+            "-c", SPEAKER_CHANNELS,
+        ], stdin=ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        if ffmpeg.stdout:
+            ffmpeg.stdout.close()
+
+        _, aplay_err = aplay.communicate(timeout=UNLOCK_SOUND_TIMEOUT_SECONDS)
+
+        try:
+            ffmpeg_err = ffmpeg.stderr.read(4096) if ffmpeg.stderr else b""
+        except Exception:
+            ffmpeg_err = b""
+
+        try:
+            ffmpeg.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            ffmpeg.kill()
+
+        if ffmpeg.returncode not in (0, None):
+            print("Unlock sound ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
+
+        if aplay.returncode != 0:
+            print("Unlock sound aplay error:", aplay_err.decode(errors="replace"), flush=True)
+
+        print("Unlock sound finished", flush=True)
+
+    except subprocess.TimeoutExpired:
+        print("Unlock sound timeout; killing playback", flush=True)
+
+        try:
+            if aplay:
+                aplay.kill()
+        except Exception:
+            pass
+
+        try:
+            if ffmpeg:
+                ffmpeg.kill()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print("Unlock sound failed:", repr(e), flush=True)
+
+    finally:
+        if relay_acquired:
+            try:
+                audio_relay_release()
+            except Exception as e:
+                print("Unlock sound relay release failed:", e, flush=True)
+
 @app.route("/speaker/raw", methods=["POST", "PUT"])
 def speaker_raw():
+    global speaker_stream_active
+
     print("Speaker raw stream started", flush=True)
+
+    with speaker_stream_lock:
+        speaker_stream_active = True
 
     total_bytes = 0
     chunks = 0
@@ -218,6 +349,9 @@ def speaker_raw():
 
         # Relay altijd uit bij einde praten / afgebroken stream.
         audio_relay_release()
+
+        with speaker_stream_lock:
+            speaker_stream_active = False
 
         elapsed = time.time() - started
         print(f"Speaker raw stream ended: {total_bytes} bytes in {elapsed:.1f}s", flush=True)

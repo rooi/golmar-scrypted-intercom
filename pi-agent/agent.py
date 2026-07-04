@@ -5,6 +5,7 @@ import json
 import subprocess
 import threading
 import time
+import select
 
 from flask import Flask, jsonify, request, Response
 
@@ -367,19 +368,21 @@ def mic_ulaw():
     Capture:
     - ALSA plughw:1,0
     - 44100 Hz
-    - stereo, gelijk aan arecord -f cd
+    - stereo, rechterkanaal c1
 
     Output:
     - μ-law
     - mono
     - 8000 Hz
 
-    Dit is RTSP-vriendelijker dan live AAC/ADTS.
+    Watchdog:
+    - als ffmpeg leeft maar geen bytes meer levert, wordt ffmpeg gestopt
+    - voorkomt de 99.9% CPU spin waarbij /mic/ulaw 200 OK geeft maar 0 bytes streamt
     """
     print("Mic μ-law stream requested", flush=True)
 
     def generate():
-        process = subprocess.Popen([
+        cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "warning",
@@ -405,21 +408,64 @@ def mic_ulaw():
             "-ar", "8000",
             "-f", "mulaw",
             "pipe:1",
-        ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-        print("ffmpeg started for mic μ-law stream", flush=True)
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+
+        print(f"ffmpeg started for mic μ-law stream pid={process.pid}", flush=True)
+
+        total_bytes = 0
+        started = time.monotonic()
+        last_bytes = started
+        no_data_timeout = 2.0
 
         try:
             while True:
-                chunk = process.stdout.read(160)
-                if not chunk:
+                if process.poll() is not None:
+                    print(
+                        f"mic μ-law ffmpeg exited code={process.returncode}, total_bytes={total_bytes}",
+                        flush=True,
+                    )
                     break
+
+                ready, _, _ = select.select([process.stdout], [], [], no_data_timeout)
+
+                if not ready:
+                    elapsed = time.monotonic() - started
+                    since_last = time.monotonic() - last_bytes
+                    print(
+                        f"mic μ-law ffmpeg stalled: no stdout for {since_last:.1f}s, "
+                        f"elapsed={elapsed:.1f}s, total_bytes={total_bytes}, killing pid={process.pid}",
+                        flush=True,
+                    )
+                    break
+
+                # 160 bytes = 20 ms bij μ-law 8000 Hz.
+                # Dit houden we bewust klein voor lage latency.
+                chunk = process.stdout.read(160)
+
+                if not chunk:
+                    elapsed = time.monotonic() - started
+                    print(
+                        f"mic μ-law ffmpeg stdout ended after {elapsed:.1f}s, total_bytes={total_bytes}",
+                        flush=True,
+                    )
+                    break
+
+                total_bytes += len(chunk)
+                last_bytes = time.monotonic()
                 yield chunk
 
         except GeneratorExit:
-            print("Mic μ-law client disconnected", flush=True)
+            print(f"Mic μ-law client disconnected, total_bytes={total_bytes}", flush=True)
 
         except Exception as e:
-            print("Mic μ-law stream error:", e, flush=True)
+            print("Mic μ-law stream error:", repr(e), flush=True)
 
         finally:
             try:
@@ -431,11 +477,25 @@ def mic_ulaw():
                 process.wait(timeout=1)
             except Exception:
                 try:
+                    print(f"mic μ-law ffmpeg did not terminate, killing pid={process.pid}", flush=True)
                     process.kill()
                 except Exception:
                     pass
 
-            print("ffmpeg stopped for mic μ-law stream", flush=True)
+            try:
+                if process.stderr:
+                    err = process.stderr.read(4096)
+                    if err:
+                        print("mic μ-law ffmpeg stderr:", err.decode(errors="replace"), flush=True)
+            except Exception:
+                pass
+
+            elapsed = time.monotonic() - started
+            print(
+                f"ffmpeg stopped for mic μ-law stream pid={process.pid}, "
+                f"total_bytes={total_bytes}, elapsed={elapsed:.1f}s",
+                flush=True,
+            )
 
     return Response(generate(), mimetype="audio/basic")
 

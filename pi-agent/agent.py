@@ -20,6 +20,9 @@ WS_PORT = 8766
 doorbell_pressed = False
 doorbell_voltage = 0.0
 
+last_doorbell_event = None
+unlock_lock = threading.Lock()
+
 # Deze waarde werkte bij jou blijkbaar al.
 # Eventueel later tunen als hij te gevoelig of juist niet gevoelig genoeg is.
 doorbell_threshold = 0.25
@@ -39,6 +42,9 @@ def health():
         "doorbell": doorbell_pressed,
         "voltage": doorbell_voltage,
         "threshold": doorbell_threshold,
+        "ws_clients": len(clients),
+        "last_doorbell_event": last_doorbell_event,
+        "time": time.time(),
     })
 
 
@@ -59,28 +65,20 @@ def unlock_http():
 
 
 def unlock_door():
-    """
-    Open deur via Automation HAT output one.
-
-    Let op:
-    Dit gebruikt bewust de Python uit de automationhat-venv.
-    Daarmee voorkom je importproblemen als dit hoofdscript buiten de venv draait.
-    """
-    print("Activating Automation HAT output one", flush=True)
-
-    subprocess.run([
-        PYTHON,
-        "-c",
-        (
-            "import automationhat, time; "
-            "automationhat.output.one.on(); "
-            "time.sleep(1); "
-            "automationhat.output.one.off()"
-        )
-    ], check=True)
-
-    print("Automation HAT output one off", flush=True)
-
+    """Open deur via Automation HAT output one."""
+    with unlock_lock:
+        print("Activating Automation HAT output one", flush=True)
+        subprocess.run([
+            PYTHON,
+            "-c",
+            (
+                "import automationhat, time; "
+                "automationhat.output.one.on(); "
+                "time.sleep(1); "
+                "automationhat.output.one.off()"
+            )
+        ], check=True, timeout=3)
+        print("Automation HAT output one off", flush=True)
 
 
 SPEAKER_DEVICE = "plughw:1,0"
@@ -792,16 +790,26 @@ def mic_raw_live():
 
     return Response(generate(), mimetype="application/octet-stream")
 
+@app.get("/doorbell")
+def doorbell_status():
+    return jsonify({
+        "ok": True,
+        "doorbell": doorbell_pressed,
+        "voltage": doorbell_voltage,
+        "threshold": doorbell_threshold,
+        "last_event": last_doorbell_event,
+        "time": time.time(),
+    })
+
 async def broadcast(event):
-    """
-    Stuur een event naar alle verbonden WebSocket-clients.
-    """
+    message = json.dumps(event)
+    print(f"Broadcasting {event.get('type')} to {len(clients)} websocket clients", flush=True)
+
     if not clients:
+        print("No WebSocket clients connected; event not delivered", flush=True)
         return
 
-    message = json.dumps(event)
     disconnected = []
-
     for websocket in list(clients):
         try:
             await websocket.send(message)
@@ -811,7 +819,6 @@ async def broadcast(event):
 
     for websocket in disconnected:
         clients.discard(websocket)
-
 
 async def handle_ws(websocket):
     """
@@ -882,6 +889,8 @@ async def handle_ws(websocket):
                     "doorbell": doorbell_pressed,
                     "voltage": doorbell_voltage,
                     "threshold": doorbell_threshold,
+                    "ws_clients": len(clients),
+                    "last_doorbell_event": last_doorbell_event,
                     "time": time.time(),
                 }))
 
@@ -910,7 +919,7 @@ def read_doorbell_loop(loop):
     pressed false -> true
     pressed true -> false
     """
-    global doorbell_pressed, doorbell_voltage
+    global doorbell_pressed, doorbell_voltage, last_doorbell_event
 
     import sys
     sys.path.insert(0, "/home/pi/venvs/automationhat/lib/python3.13/site-packages")
@@ -947,6 +956,7 @@ def read_doorbell_loop(loop):
                 }
 
                 print(event, flush=True)
+                last_doorbell_event = event
                 asyncio.run_coroutine_threadsafe(broadcast(event), loop)
 
         except Exception as e:

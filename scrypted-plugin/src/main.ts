@@ -99,6 +99,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
     private piWs: any;
     private piWsConnected = false;
+    private piHeartbeatTimer: any;
+    private lastPiPong = 0;
     private reconnectTimer: any;
     private pendingCommands: PendingWsCommand[] = [];
     private lastDoorbellResetTimer: any;
@@ -703,7 +705,13 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
                 title: 'Reconnect Pi WebSocket',
                 description: 'Reconnect to the Pi agent WebSocket.',
                 type: 'button',
-            }
+            },
+            {
+                key: 'testAudioRoundtripLatency',
+                title: 'Test Audio Roundtrip Latency',
+                description: 'Play a short tone to the Golmar speaker and measure when it returns via /mic/ulaw.',
+                type: 'button',
+            },
         );
 
         return settings;
@@ -745,6 +753,12 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         if (key === 'piWsUrl') {
             this.reconnectPiWebSocket();
         }
+
+        if (key === 'testAudioRoundtripLatency') {
+            await this.testAudioRoundtripLatency();
+            return;
+        }
+
     }
 
     getPiBaseUrl(): string {
@@ -805,8 +819,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         this.piWs.onopen = () => {
             this.piWsConnected = true;
-            this.bumpStreamGeneration('Pi WebSocket connected');
+            this.lastPiPong = Date.now();
             this.console.log(`Pi WebSocket connected: ${url}`);
+            this.startPiHeartbeat();
         };
 
         this.piWs.onmessage = (event: any) => {
@@ -821,8 +836,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             this.console.warn('Pi WebSocket closed');
             this.piWsConnected = false;
             this.piWs = undefined;
-            this.bumpStreamGeneration('Pi WebSocket closed');
-
+            this.stopPiHeartbeat();
             this.rejectPendingWsCommands(new Error('Pi WebSocket closed'));
             this.schedulePiWsReconnect();
         };
@@ -863,6 +877,41 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         }, 3000);
     }
 
+    startPiHeartbeat() {
+        this.stopPiHeartbeat();
+
+        this.piHeartbeatTimer = setInterval(() => {
+            if (!this.piWs || !this.piWsConnected) {
+                return;
+            }
+
+            const ageMs = Date.now() - this.lastPiPong;
+
+            if (ageMs > 45000) {
+                this.console.warn(`Pi WebSocket heartbeat stale (${ageMs}ms), reconnecting`);
+                this.reconnectPiWebSocket();
+                return;
+            }
+
+            try {
+                this.piWs.send(JSON.stringify({
+                    type: 'ping',
+                    time: Date.now(),
+                }));
+            } catch (e) {
+                this.console.warn(`Pi WebSocket heartbeat send failed: ${e}`);
+                this.reconnectPiWebSocket();
+            }
+        }, 15000);
+    }
+
+    stopPiHeartbeat() {
+        if (this.piHeartbeatTimer) {
+            clearInterval(this.piHeartbeatTimer);
+            this.piHeartbeatTimer = undefined;
+        }
+    }
+
     handlePiWsMessage(raw: any) {
         const text = typeof raw === 'string' ? raw : raw?.toString?.() || '';
 
@@ -884,6 +933,12 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             return;
         }
 
+        if (event.type === 'pong') {
+            this.lastPiPong = Date.now();
+            this.console.log(`Pi agent pong: ${JSON.stringify(event)}`);
+            return;
+        }
+
         if (event.type === 'doorbell') {
             this.handleDoorbellEvent(event);
             return;
@@ -893,6 +948,208 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             // Compatibiliteit, mocht de Pi-agent later 'bell' sturen.
             this.handleDoorbellEvent(event);
             return;
+        }
+    }
+
+    private ulawDecodeSample(u: number): number {
+        u = ~u & 0xff;
+        const sign = u & 0x80;
+        const exponent = (u >> 4) & 0x07;
+        const mantissa = u & 0x0f;
+        let sample = ((mantissa << 3) + 0x84) << exponent;
+        sample -= 0x84;
+        return sign ? -sample : sample;
+    }
+
+    private makeChirpS16le48k(): { buffer: Buffer; reference8k: Float32Array; startMs: number } {
+        const outRate = 48000;
+        const refRate = 8000;
+
+        const startMs = 200;
+        const toneMs = 80;
+        const totalMs = 700;
+
+        const totalSamples = Math.floor(outRate * totalMs / 1000);
+        const startSample = Math.floor(outRate * startMs / 1000);
+        const toneSamples = Math.floor(outRate * toneMs / 1000);
+
+        const pcm = Buffer.alloc(totalSamples * 2);
+
+        for (let i = 0; i < toneSamples; i++) {
+            const t = i / outRate;
+            const p = i / toneSamples;
+
+            const f0 = 1200;
+            const f1 = 3200;
+            const freq = f0 + (f1 - f0) * p;
+
+            const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * p);
+            const sample = Math.sin(2 * Math.PI * freq * t) * window * 0.35;
+
+            const s16 = Math.max(-32767, Math.min(32767, Math.round(sample * 32767)));
+            pcm.writeInt16LE(s16, (startSample + i) * 2);
+        }
+
+        const refSamples = Math.floor(refRate * toneMs / 1000);
+        const reference8k = new Float32Array(refSamples);
+
+        for (let i = 0; i < refSamples; i++) {
+            const t = i / refRate;
+            const p = i / refSamples;
+
+            const f0 = 1200;
+            const f1 = 3200;
+            const freq = f0 + (f1 - f0) * p;
+
+            const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * p);
+            reference8k[i] = Math.sin(2 * Math.PI * freq * t) * window;
+        }
+
+        return { buffer: pcm, reference8k, startMs };
+    }
+
+    private findCorrelationPeak(signal: Float32Array, reference: Float32Array, minIndex = 0): number {
+        let bestIndex = minIndex;
+        let bestScore = -Infinity;
+
+        for (let i = minIndex; i <= signal.length - reference.length; i++) {
+            let score = 0;
+
+            for (let j = 0; j < reference.length; j++) {
+                score += signal[i + j] * reference[j];
+            }
+
+            const absScore = Math.abs(score);
+            if (absScore > bestScore) {
+                bestScore = absScore;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    async testAudioRoundtripLatency(): Promise<void> {
+        const piBaseUrl = this.getPiBaseUrl();
+        const session = `latency-${Date.now()}`;
+
+        const micUrl = `${piBaseUrl}/mic/ulaw?session=${encodeURIComponent(session)}`;
+        const speakerUrl = `${piBaseUrl}/speaker/raw`;
+
+        const sampleRate = 8000;
+        const recordMs = 5000;
+        const { buffer: tonePcm48k, reference8k, startMs } = this.makeChirpS16le48k();
+
+        this.console.log(`[latency] Starting roundtrip test`);
+        this.console.log(`[latency] Mic URL: ${micUrl}`);
+        this.console.log(`[latency] Speaker URL: ${speakerUrl}`);
+
+        // Kleine pauze om restanten van vorige test minder kans te geven.
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        const controller = new AbortController();
+        const chunks: Buffer[] = [];
+
+        const micPromise = (async () => {
+            const response = await fetch(micUrl, {
+                method: 'GET',
+                signal: controller.signal,
+            });
+
+            if (!response.ok || !response.body) {
+                throw new Error(`mic fetch failed: ${response.status} ${response.statusText}`);
+            }
+
+            const reader = response.body.getReader();
+
+            try {
+                while (true) {
+                    const result = await reader.read();
+
+                    if (result.done) {
+                        break;
+                    }
+
+                    if (result.value?.length) {
+                        chunks.push(Buffer.from(result.value));
+                    }
+                }
+            } catch {
+                // Expected when aborted after record window.
+            }
+        })();
+
+        // Geef /mic/ulaw even tijd om echt te streamen voordat de toon start.
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        const speakerStartedAt = Date.now();
+
+        const speakerPromise = fetch(speakerUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+            },
+            body: tonePcm48k,
+        }).then(response => {
+            if (!response.ok) {
+                throw new Error(`speaker POST failed: ${response.status} ${response.statusText}`);
+            }
+            return response;
+        }).catch(e => {
+            this.console.warn(`[latency] speaker POST failed: ${e?.message || e}`);
+        });
+
+        this.console.log(`[latency] Speaker POST started at ${speakerStartedAt}`);
+
+        // Niet wachten op speakerPromise: /speaker/raw returned pas nadat alle audio verwerkt is.
+        await new Promise(resolve => setTimeout(resolve, recordMs));
+
+        controller.abort();
+
+        try {
+            await micPromise;
+        } catch {
+            // Ignore abort.
+        }
+
+        try {
+            await speakerPromise;
+        } catch {
+            // Already logged above.
+        }
+
+        const ulaw = Buffer.concat(chunks);
+
+        this.console.log(`[latency] Captured ${ulaw.length} ulaw bytes`);
+
+        if (ulaw.length < sampleRate) {
+            this.console.warn(`[latency] Too little audio captured. Is /mic/ulaw streaming?`);
+            return;
+        }
+
+        const signal = new Float32Array(ulaw.length);
+
+        for (let i = 0; i < ulaw.length; i++) {
+            signal[i] = this.ulawDecodeSample(ulaw[i]) / 32768;
+        }
+
+        // Zoek niet vóór de verwachte speelstart; dat voorkomt oude/valse pieken.
+        const minSearchMs = startMs + 20;
+        const minSearchIndex = Math.floor(sampleRate * minSearchMs / 1000);
+
+        const peak = this.findCorrelationPeak(signal, reference8k, minSearchIndex);
+
+        const detectedMs = peak / sampleRate * 1000;
+        const latencyMs = detectedMs - startMs;
+
+        this.console.log(`[latency] Detected tone at ${detectedMs.toFixed(1)} ms`);
+        this.console.log(`[latency] Playback tone started at ${startMs.toFixed(1)} ms`);
+        this.console.log(`[latency] Estimated audio roundtrip latency: ${latencyMs.toFixed(1)} ms`);
+
+        if (latencyMs < 0) {
+            this.console.warn(`[latency] Negative latency: likely false detection or old buffered audio.`);
+        } else if (latencyMs > 1000) {
+            this.console.warn(`[latency] High latency detected. This may be buffered audio or a delayed /mic/ulaw path.`);
         }
     }
 
@@ -988,32 +1245,40 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async unlockDoor(): Promise<void> {
-        this.console.log('Unlocking via Pi WebSocket');
+        const url = `${this.getPiBaseUrl()}/unlock`;
+
+        this.console.log(`Unlocking via Pi HTTP primary: ${url}`);
 
         try {
-            const response = await this.sendPiWsCommand({
-                type: 'unlock',
-            }, 'unlock');
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 4000);
 
-            this.console.log(`Unlock OK via WebSocket: ${JSON.stringify(response)}`);
-            return;
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    signal: controller.signal,
+                });
+
+                const body = await response.text();
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} ${response.statusText}: ${body}`);
+                }
+
+                this.console.log(`Unlock OK via HTTP: ${body}`);
+                return;
+            } finally {
+                clearTimeout(timeout);
+            }
         } catch (e) {
-            this.console.warn(`Unlock via WebSocket failed, falling back to HTTP: ${e}`);
+            this.console.warn(`Unlock via HTTP failed, falling back to WebSocket: ${e}`);
         }
 
-        const url = `${this.getPiBaseUrl()}/unlock`;
-        this.console.log(`Unlocking via Pi HTTP fallback: ${url}`);
+        const response = await this.sendPiWsCommand({
+            type: 'unlock',
+        }, 'unlock');
 
-        const response = await fetch(url, {
-            method: 'POST',
-        });
-
-        if (!response.ok) {
-            throw new Error(`Unlock failed: ${response.status} ${response.statusText}`);
-        }
-
-        const body = await response.text();
-        this.console.log(`Unlock OK via HTTP: ${body}`);
+        this.console.log(`Unlock OK via WebSocket fallback: ${JSON.stringify(response)}`);
     }
 
     // most cameras have motion and doorbell press events, but dont notify when the event ends.

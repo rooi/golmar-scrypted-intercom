@@ -1,41 +1,33 @@
 import {
-  BinarySensor,
-  Camera,
-  Device,
-  DeviceCreator,
-  DeviceCreatorSettings,
-  DeviceProvider,
-  FFmpegInput,
-  Intercom,
-  Lock,
-  LockState,
-  MediaObject,
-  MediaStreamOptions,
-  MotionSensor,
-  PictureOptions,
-  ResponseMediaStreamOptions,
-  ScryptedDeviceBase,
-  ScryptedDeviceType,
-  ScryptedInterface,
-  ScryptedMimeTypes,
-  Setting,
-  Settings,
-  SettingValue,
-  VideoCamera,
+    BinarySensor,
+    Camera,
+    Device,
+    DeviceCreator,
+    DeviceCreatorSettings,
+    DeviceProvider,
+    FFmpegInput,
+    Intercom,
+    MediaObject,
+    MediaStreamOptions,
+    MotionSensor,
+    PictureOptions,
+    ResponseMediaStreamOptions,
+    ScryptedDeviceBase,
+    ScryptedDeviceType,
+    ScryptedInterface,
+    ScryptedMimeTypes,
+    Setting,
+    Settings,
+    SettingValue,
+    VideoCamera
 } from '@scrypted/sdk';
 
 import sdk from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
-import fs from 'fs';
-import path from 'path';
-import { createServer, Server, ServerResponse } from 'http';
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
 const { deviceManager, mediaManager } = sdk;
-
-// use the dog.jpg from the fs directory that will be packaged with the plugin
-const dogImage = fs.readFileSync('dog.jpg');
 
 type PendingWsCommand = {
     expectedType: string;
@@ -53,463 +45,120 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         },
         piWsUrl: {
             title: 'Pi Agent WebSocket URL',
-            description: 'Example: ws://10.0.1.41:8766',
-            defaultValue: 'ws://10.0.1.41:8766',
+            description: 'Example: ws://192.168.1.123:8766',
+            defaultValue: 'ws://192.168.1.123:8766',
         },
-
-        videoMode: {
-            title: 'Video Mode',
-            description: 'live = live RTSP video. snapshot = still image video with live audio.',
-            choices: ['live', 'snapshot'],
-            defaultValue: 'live',
-        },
-        cameraRtspUrl: {
-            title: 'Camera RTSP URL',
-            description: 'RTSP source for live video and snapshots.',
+        syntheticRtspUrl: {
+            title: 'Synthetic Stream RTSP URL',
+            description: 'RTSP Rebroadcast URL from the Scrypted Synthetic Stream device. Example: rtsp://127.0.0.1:xxxxx/...',
             defaultValue: '',
         },
-        videoCrop: {
-            title: 'Video Crop',
-            description: 'FFmpeg video filter for crop/snapshot. Example: crop=1280:720:1280:720',
-            defaultValue: 'crop=1280:720:1280:720',
-        },
-        videoWidth: {
-            title: 'Video Width',
-            defaultValue: '1280',
-        },
-        videoHeight: {
-            title: 'Video Height',
-            defaultValue: '720',
-        },
-        videoFps: {
-            title: 'Video FPS',
-            defaultValue: '15',
-        },
-        snapshotVideoFps: {
-            title: 'Snapshot Video FPS',
-            description: 'FPS for still-image video mode. 1 to 5 is usually enough.',
-            defaultValue: '2',
-        },
-        snapshotRefreshSeconds: {
-            title: 'Snapshot Refresh Seconds',
-            description: 'How often to refresh the still image while a snapshot video stream is active. Set 0 to disable.',
-            defaultValue: '10',
+        snapshotUrl: {
+            title: 'Snapshot URL',
+            description: 'Optional JPEG snapshot URL. Leave empty to use Pi Agent /snapshot.jpg.',
+            defaultValue: '',
         },
     });
 
     private piWs: any;
     private piWsConnected = false;
-    private piHeartbeatTimer: any;
-    private lastPiPong = 0;
     private reconnectTimer: any;
     private pendingCommands: PendingWsCommand[] = [];
     private lastDoorbellResetTimer: any;
 
     private intercomProcess?: ChildProcessWithoutNullStreams;
 
-    private snapshotCachePath = path.join(
-        process.env.SCRYPTED_PLUGIN_VOLUME || '/tmp',
-        'golmar-snapshot.jpg'
-    );
-    private streamGeneration = 0;
-
-    private startupSnapshotPromise?: Promise<void>;
-    private snapshotReady = false;
-
-    private snapshotRefreshTimer?: any;
-    private snapshotRefreshRunning = false;
-    private snapshotRefreshLeaseTimer?: any;
+    private lastSnapshot?: Buffer;
+    private lastSnapshotTime = 0;
+    private readonly snapshotCacheMs = 15000;
 
     constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
         super(nativeId);
 
         // Start iets later zodat Scrypted/device init rustig klaar is.
         setTimeout(() => this.connectPiWebSocket(), 1000);
-
-        // Maak één snapshot bij opstarten. Daarna hergebruiken.
-        setTimeout(() => {
-            this.startupSnapshotPromise = this.refreshSnapshot()
-                .then(() => {
-                    this.snapshotReady = true;
-                    this.console.log(`Startup snapshot ready: ${this.snapshotCachePath}`);
-                })
-                .catch(e => {
-                    this.console.warn(`Startup snapshot failed, using fallback later: ${e}`);
-
-                    if (!fs.existsSync(this.snapshotCachePath)) {
-                        fs.writeFileSync(this.snapshotCachePath, dogImage);
-                    }
-
-                    this.snapshotReady = false;
-                });
-        }, 2000);
-    }
-
-    private bumpStreamGeneration(reason: string) {
-        this.streamGeneration++;
-        this.console.log(`Stream generation bumped to ${this.streamGeneration}: ${reason}`);
-    }
-
-    async refreshSnapshot(): Promise<Buffer> {
-        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
-        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
-
-        if (!cameraRtspUrl) {
-            fs.writeFileSync(this.snapshotCachePath, dogImage);
-            return dogImage;
-        }
-
-        const ffmpegPath = await mediaManager.getFFmpegPath();
-
-        const args = [
-            '-hide_banner',
-            '-loglevel', 'warning',
-
-            '-rtsp_transport', 'tcp',
-            '-probesize', '500000',
-            '-analyzeduration', '1000000',
-            '-i', cameraRtspUrl,
-
-            '-map', '0:v:0',
-            '-vf', videoCrop,
-
-            '-frames:v', '1',
-            '-q:v', '3',
-            '-f', 'image2pipe',
-            '-vcodec', 'mjpeg',
-            'pipe:1',
-        ];
-
-        this.console.log(`Refreshing snapshot: ${ffmpegPath} ${args.join(' ')}`);
-
-        const jpeg = await new Promise<Buffer>((resolve, reject) => {
-            const child = spawn(ffmpegPath, args);
-
-            const chunks: Buffer[] = [];
-            const errors: Buffer[] = [];
-
-            const timeout = setTimeout(() => {
-                try {
-                    child.kill('SIGKILL');
-                } catch {
-                    // ignore
-                }
-                reject(new Error('Snapshot ffmpeg timed out'));
-            }, 10000);
-
-            child.stdout.on('data', data => {
-                chunks.push(Buffer.from(data));
-            });
-
-            child.stderr.on('data', data => {
-                errors.push(Buffer.from(data));
-            });
-
-            child.on('error', error => {
-                clearTimeout(timeout);
-                reject(error);
-            });
-
-            child.on('exit', code => {
-                clearTimeout(timeout);
-
-                const stderr = Buffer.concat(errors).toString();
-                const buffer = Buffer.concat(chunks);
-
-                if (code !== 0) {
-                    reject(new Error(`Snapshot ffmpeg exited with code ${code}: ${stderr}`));
-                    return;
-                }
-
-                if (!buffer.length) {
-                    reject(new Error(`Snapshot ffmpeg produced no output: ${stderr}`));
-                    return;
-                }
-
-                resolve(buffer);
-            });
-        });
-
-        const tmpPath = `${this.snapshotCachePath}.tmp`;
-        fs.writeFileSync(tmpPath, jpeg);
-        fs.renameSync(tmpPath, this.snapshotCachePath);
-        return jpeg;
     }
 
     async takePicture(options?: PictureOptions): Promise<MediaObject> {
+        const now = Date.now();
+
+        // Korte cache voorkomt dat Scrypted/HomeKit meerdere snapshots tegelijk opvraagt.
+        if (this.lastSnapshot && now - this.lastSnapshotTime < this.snapshotCacheMs) {
+            return mediaManager.createMediaObject(this.lastSnapshot, 'image/jpeg');
+        }
+
+        const snapshotUrl = this.getSnapshotUrl();
+
+        this.console.log(`Fetching snapshot: ${snapshotUrl}`);
+
         try {
-            // Gebruik de startup snapshot. Niet telkens opnieuw de camera wakker maken.
-            if (this.startupSnapshotPromise) {
-                try {
-                    await this.startupSnapshotPromise;
-                } catch {
-                    // fallback hieronder
-                }
+            const response = await fetch(snapshotUrl);
+
+            if (!response.ok) {
+                throw new Error(`Snapshot failed: ${response.status} ${response.statusText}`);
             }
 
-            if (fs.existsSync(this.snapshotCachePath)) {
-                return mediaManager.createMediaObject(
-                    fs.readFileSync(this.snapshotCachePath),
-                    'image/jpeg'
-                );
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+
+            if (!buffer.length) {
+                throw new Error('Snapshot response was empty');
             }
 
-            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+            this.lastSnapshot = buffer;
+            this.lastSnapshotTime = now;
+
+            return mediaManager.createMediaObject(buffer, 'image/jpeg');
         } catch (e) {
-            this.console.warn(`Failed to read cached snapshot, using fallback: ${e}`);
-            return mediaManager.createMediaObject(dogImage, 'image/jpeg');
+            this.console.warn(`Snapshot fetch failed: ${e}`);
+
+            // Fallback: toon de laatst succesvolle snapshot als die er is.
+            if (this.lastSnapshot) {
+                return mediaManager.createMediaObject(this.lastSnapshot, 'image/jpeg');
+            }
+
+            throw e;
         }
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
-        return [
-            {
-                id: 'default',
-                name: 'Snapshot',
-                width: 1280,
-                height: 720,
-            } as PictureOptions,
-        ];
-    }
-
-    private getSnapshotRefreshSeconds(): number {
-        const value = Number(this.settingsStorage.values.snapshotRefreshSeconds || '10');
-
-        if (!Number.isFinite(value) || value <= 0) {
-            return 0;
-        }
-
-        // Niet te agressief. RTSP snapshot pakken is relatief duur.
-        return Math.max(2, Math.floor(value));
-    }
-
-    private async refreshSnapshotSafely(reason: string): Promise<void> {
-        if (this.snapshotRefreshRunning) {
-            this.console.log(`Snapshot refresh skipped, already running: ${reason}`);
-            return;
-        }
-
-        this.snapshotRefreshRunning = true;
-
-        try {
-            this.console.log(`Snapshot refresh started: ${reason}`);
-            await this.refreshSnapshot();
-            this.snapshotReady = true;
-            this.console.log(`Snapshot refresh ready: ${reason}`);
-        } catch (e) {
-            this.console.warn(`Snapshot refresh failed (${reason}): ${e}`);
-
-            if (!fs.existsSync(this.snapshotCachePath)) {
-                fs.writeFileSync(this.snapshotCachePath, dogImage);
-            }
-        } finally {
-            this.snapshotRefreshRunning = false;
-        }
-    }
-
-    private startSnapshotRefreshLoop(): void {
-        const refreshSeconds = this.getSnapshotRefreshSeconds();
-
-        if (refreshSeconds <= 0) {
-            this.console.log('Snapshot periodic refresh disabled.');
-            return;
-        }
-
-        if (!this.snapshotRefreshTimer) {
-            this.console.log(`Starting snapshot refresh loop every ${refreshSeconds}s`);
-
-            this.snapshotRefreshTimer = setInterval(() => {
-                this.refreshSnapshotSafely('periodic stream refresh');
-            }, refreshSeconds * 1000);
-        }
-
-        // Verleng de "lease" telkens wanneer een stream wordt gestart.
-        // Omdat Scrypted geen simpele stream-ended callback geeft, stoppen we
-        // de refresh-loop automatisch na een tijdje zonder nieuwe stream-start.
-        if (this.snapshotRefreshLeaseTimer) {
-            clearTimeout(this.snapshotRefreshLeaseTimer);
-        }
-
-        const leaseMs = Math.max(30000, refreshSeconds * 3000);
-
-        this.snapshotRefreshLeaseTimer = setTimeout(() => {
-            this.stopSnapshotRefreshLoop();
-        }, leaseMs);
-    }
-
-    private stopSnapshotRefreshLoop(): void {
-        if (this.snapshotRefreshTimer) {
-            clearInterval(this.snapshotRefreshTimer);
-            this.snapshotRefreshTimer = undefined;
-        }
-
-        if (this.snapshotRefreshLeaseTimer) {
-            clearTimeout(this.snapshotRefreshLeaseTimer);
-            this.snapshotRefreshLeaseTimer = undefined;
-        }
-
-        this.console.log('Stopped snapshot refresh loop');
+        return [];
     }
 
     async getVideoStream(options?: MediaStreamOptions): Promise<MediaObject> {
         this.console.log(`getVideoStream requested: ${JSON.stringify(options)}`);
 
-        const videoMode = (this.settingsStorage.values.videoMode as string || 'live').trim();
-        const cameraRtspUrl = (this.settingsStorage.values.cameraRtspUrl as string || '').trim();
-        const videoCrop = (this.settingsStorage.values.videoCrop as string || 'crop=1280:720:1280:720').trim();
+        const syntheticRtspUrl = this.getSyntheticRtspUrl();
+        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw`;
 
-        const videoFps = String(Number(this.settingsStorage.values.videoFps || '15') || 15);
-        const snapshotVideoFps = String(Number(this.settingsStorage.values.snapshotVideoFps || '2') || 2);
+        if (!syntheticRtspUrl) {
+            throw new Error('Synthetic Stream RTSP URL is not configured. Set it in the Golmar device settings.');
+        }
 
-        const session = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        const micUrl = `${this.getPiBaseUrl()}/mic/ulaw?session=${encodeURIComponent(session)}`;
-
-        this.console.log(`Video mode: ${videoMode}`);
-        this.console.log(`Using camera RTSP URL: ${cameraRtspUrl || '(not configured)'}`);
-        this.console.log(`Using video crop: ${videoCrop}`);
+        this.console.log(`Using synthetic RTSP video URL: ${syntheticRtspUrl}`);
         this.console.log(`Using mic URL: ${micUrl}`);
 
-        const inputArguments: string[] = [];
-
-        if (videoMode === 'snapshot') {
-            
-            
-            if (!fs.existsSync(this.snapshotCachePath)) {
-                this.console.warn('No cached snapshot available, using fallback dog image.');
-                fs.writeFileSync(this.snapshotCachePath, dogImage);
-            }
-
-            this.startSnapshotRefreshLoop();
-
-            this.console.log(`Using periodically refreshed snapshot still video: ${this.snapshotCachePath}`);
-
-            inputArguments.push(
-                '-re',
-                '-loop', '1',
-                '-framerate', snapshotVideoFps,
-                '-i', this.snapshotCachePath,
-            );
-        }
-        else if (cameraRtspUrl) {
-            // Live camera mode.
-            inputArguments.push(
-                '-thread_queue_size', '8',
-                '-rtsp_transport', 'tcp',
-                '-probesize', '500000',
-                '-analyzeduration', '1000000',
-                '-i', cameraRtspUrl,
-            );
-        }
-        else {
-            // Fallback dummy video.
-            const file = path.join(
-                process.env.SCRYPTED_PLUGIN_VOLUME,
-                'zip',
-                'unzipped',
-                'fs',
-                'people.mp4'
-            );
-
-            this.console.log(`No camera configured, using fallback video: ${file}`);
-
-            inputArguments.push(
-                '-re',
-                '-stream_loop', '-1',
-                '-i', file,
-            );
-        }
-
-        // Live Golmar/Pi audio.
-        inputArguments.push(
-            '-thread_queue_size', '8',
-            '-fflags', 'nobuffer',
-            '-flags', 'low_delay',
-            //'-avioflags', 'direct',
-            '-use_wallclock_as_timestamps', '1',
-            '-probesize', '32',
-            '-analyzeduration', '0',
-            '-f', 'mulaw',
-            '-ar', '8000',
-            '-ac', '1',
-            '-i', micUrl,
-
-            '-map', '0:v:0',
-            '-map', '1:a:0',
-        );
-
-        // In live camera mode, crop the live video.
-        // In snapshot mode, the JPEG is already cropped by refreshSnapshot().
-        if (videoMode !== 'snapshot' && cameraRtspUrl && videoCrop) {
-            inputArguments.push(
-                '-vf', videoCrop,
-            );
-        }
-
-        const fpsNumberForOptions = videoMode === 'snapshot'
-            ? Number(snapshotVideoFps) || 5
-            : Number(videoFps) || 15;
-
         const ffmpegInput: FFmpegInput = {
-            inputArguments,
+            inputArguments: [
+                // Audio van de Golmar/Pi-agent.
+                '-fflags', 'nobuffer',
+                '-flags', 'low_delay',
+                '-probesize', '32',
+                '-analyzeduration', '0',
+                '-f', 'mulaw',
+                '-ar', '8000',
+                '-ac', '1',
+                '-i', micUrl,
+
+                // Video uit de Scrypted Synthetic Stream.
+                '-rtsp_transport', 'tcp',
+                '-i', syntheticRtspUrl,
+
+                // Gebruik audio van Pi-agent en video van synthetic stream.
+                '-map', '1:v:0',
+                '-map', '0:a:0',
+            ],
         };
-
-        if (videoMode === 'snapshot') {
-            const fpsNumber = Number(snapshotVideoFps) || 2;
-
-            ffmpegInput.h264EncoderArguments = [
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-
-                '-profile:v', 'main',
-                '-level:v', '3.1',
-                '-pix_fmt', 'yuv420p',
-
-                '-r', String(fpsNumber),
-                '-g', String(fpsNumber),
-                '-keyint_min', String(fpsNumber),
-                '-sc_threshold', '0',
-                '-bf', '0',
-
-                //// Geen zerolatency/sliced threads; dat gaf HomeKit-gedoe.
-                //'-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
-                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0:sync-lookahead=0:rc-lookahead=0',
-
-                // Stilstaand beeld heeft weinig bitrate nodig.
-                '-b:v', '120k',
-                '-maxrate', '120k',
-                '-bufsize', '60k',
-
-                '-muxdelay', '0',
-                '-muxpreload', '0',
-                '-flush_packets', '1',
-            ];
-        }
-        else if (cameraRtspUrl) {
-            const fpsNumber = Number(videoFps) || 15;
-
-            ffmpegInput.h264EncoderArguments = [
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-
-                '-profile:v', 'main',
-                '-level:v', '3.1',
-                '-pix_fmt', 'yuv420p',
-
-                '-r', String(fpsNumber),
-                '-g', String(fpsNumber),
-                '-keyint_min', String(fpsNumber),
-                '-sc_threshold', '0',
-                '-bf', '0',
-                '-force_key_frames', 'expr:gte(t,n_forced*1)',
-
-                '-x264-params', 'repeat-headers=1:aud=1:open-gop=0:sliced-threads=0',
-
-                '-b:v', '280k',
-                '-maxrate', '280k',
-                '-bufsize', '560k',
-            ];
-        }
 
         return mediaManager.createMediaObject(
             Buffer.from(JSON.stringify(ffmpegInput)),
@@ -518,36 +167,22 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        const videoMode = (this.settingsStorage.values.videoMode as string || 'live').trim();
-
-        const width = Number(this.settingsStorage.values.videoWidth || '1280');
-        const height = Number(this.settingsStorage.values.videoHeight || '720');
-        const fps = videoMode === 'snapshot'
-        ? Number(this.settingsStorage.values.snapshotVideoFps || '5') || 5
-        : Number(this.settingsStorage.values.videoFps || '15') || 15;
-
         return [{
             id: 'stream',
             name: 'Golmar Stream',
+            video: {
+                codec: 'h264',
+            },
             audio: {
                 codec: 'pcm_mulaw',
             },
-            video: {
-                codec: 'h264',
-                width,
-                height,
-                fps,
-            }
         }];
     }
 
     async startIntercom(media: MediaObject): Promise<void> {
         this.console.log('Intercom start requested');
 
-        if (this.intercomProcess && !this.intercomProcess.killed) {
-            this.console.log('Intercom ffmpeg already running, not starting another one.');
-            return;
-        }
+        await this.stopIntercom();
 
         const ffmpegInput: FFmpegInput = JSON.parse(
             (await mediaManager.convertMediaObjectToBuffer(
@@ -561,52 +196,54 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         const ffmpegPath = await mediaManager.getFFmpegPath();
         const outputUrl = `${this.getPiBaseUrl()}/speaker/raw`;
 
-        const inputArguments = [...ffmpegInput.inputArguments];
+        let inputArguments: string[];
 
-        // HomeKit geeft soms een lokale RTSP intercom stream zonder transport.
-        // Voeg dan expliciet TCP toe vóór de bijbehorende -i.
-        // Safari/WebRTC levert dit meestal al correct aan; dan wijzigen we niets.
-        const rtspUrlIndex = inputArguments.findIndex(arg =>
-            typeof arg === 'string' && arg.startsWith('rtsp://')
-        );
+        // HomeKit/Safari geven meestal een lokale RTSP bron terug.
+        // Forceer TCP, want zonder dit zie je:
+        // method SETUP failed: 461 Unsupported Transport
+        if ((ffmpegInput as any).url && (ffmpegInput as any).url.toString().startsWith('rtsp://')) {
+            inputArguments = [
+                '-rtsp_transport', 'tcp',
+                '-acodec', 'libopus',
+                '-i', (ffmpegInput as any).url.toString(),
+            ];
+        } else {
+            inputArguments = ffmpegInput.inputArguments || [];
 
-        if (rtspUrlIndex >= 0) {
-            const inputFlagIndex = inputArguments.lastIndexOf('-i', rtspUrlIndex);
+            // Als Scrypted al inputArguments geeft met een RTSP URL maar zonder tcp,
+            // voeg tcp dan alsnog vóór de input toe.
+            const hasRtspInput = inputArguments.some(arg => typeof arg === 'string' && arg.startsWith('rtsp://'));
+            const hasRtspTransport = inputArguments.includes('-rtsp_transport');
 
-            if (inputFlagIndex >= 0) {
-                const lowLatencyInputArgs = [
-                    '-fflags', 'nobuffer',
-                    '-flags', 'low_delay',
-                    '-probesize', '32',
-                    '-analyzeduration', '0',
-                    '-thread_queue_size', '8',
+            if (hasRtspInput && !hasRtspTransport) {
+                inputArguments = [
+                    '-rtsp_transport', 'tcp',
+                    ...inputArguments,
                 ];
-
-                if (!inputArguments.includes('-rtsp_transport')) {
-                    lowLatencyInputArgs.push('-rtsp_transport', 'tcp');
-                }
-
-                inputArguments.splice(inputFlagIndex, 0, ...lowLatencyInputArgs);
             }
         }
 
-        this.console.log(`Normalized intercom input args: ${JSON.stringify(inputArguments)}`);
-
         const args = [
-        '-hide_banner',
-        '-loglevel', 'warning',
-        '-nostdin',
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-nostdin',
 
-        ...inputArguments,
+            ...inputArguments,
 
-        '-vn',
-        '-af', 'highpass=f=300,lowpass=f=3400,volume=8,alimiter=limit=0.85',
-        '-acodec', 'pcm_s16le',
-        '-ac', '1',
-        '-ar', '48000',
-        '-f', 's16le',
-        '-method', 'POST',
-        outputUrl,
+            '-vn',
+
+            // Telefoonbandbreedte + limiter. Volume kun je later finetunen.
+            '-af', 'highpass=f=300,lowpass=f=3400,volume=8,alimiter=limit=0.85',
+
+            // Pi endpoint verwacht raw PCM.
+            // Zonder -f s16le krijg je:
+            // Unable to choose an output format for http://.../speaker/raw
+            '-acodec', 'pcm_s16le',
+            '-ac', '1',
+            '-ar', '48000',
+            '-f', 's16le',
+
+            outputUrl,
         ];
 
         this.console.log(`Starting intercom ffmpeg: ${ffmpegPath} ${args.join(' ')}`);
@@ -635,35 +272,17 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     async stopIntercom(): Promise<void> {
         this.console.log('Intercom stop requested');
 
-        const process = this.intercomProcess;
-        if (!process) {
+        if (!this.intercomProcess) {
             return;
+        }
+
+        try {
+            this.intercomProcess.kill('SIGTERM');
+        } catch (e) {
+            this.console.warn(`Failed to stop intercom ffmpeg: ${e}`);
         }
 
         this.intercomProcess = undefined;
-
-        try {
-            process.kill('SIGTERM');
-        } catch (e) {
-            this.console.warn(`Failed to stop intercom ffmpeg: ${e}`);
-            return;
-        }
-
-        await new Promise<void>((resolve) => {
-            const timeout = setTimeout(() => {
-                try {
-                    process.kill('SIGKILL');
-                } catch {
-                    // ignore
-                }
-                resolve();
-            }, 1000);
-
-            process.once('exit', () => {
-                clearTimeout(timeout);
-                resolve();
-            });
-        });
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -705,13 +324,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
                 title: 'Reconnect Pi WebSocket',
                 description: 'Reconnect to the Pi agent WebSocket.',
                 type: 'button',
-            },
-            {
-                key: 'testAudioRoundtripLatency',
-                title: 'Test Audio Roundtrip Latency',
-                description: 'Play a short tone to the Golmar speaker and measure when it returns via /mic/ulaw.',
-                type: 'button',
-            },
+            }
         );
 
         return settings;
@@ -754,19 +367,32 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             this.reconnectPiWebSocket();
         }
 
-        if (key === 'testAudioRoundtripLatency') {
-            await this.testAudioRoundtripLatency();
-            return;
+        if (key === 'snapshotUrl') {
+            this.lastSnapshot = undefined;
+            this.lastSnapshotTime = 0;
         }
-
     }
 
     getPiBaseUrl(): string {
-        return (this.settingsStorage.values.piBaseUrl as string || 'http://10.0.1.41:8765').replace(/\/$/, '');
+        return (this.settingsStorage.values.piBaseUrl as string || 'http://192.168.1.123:8765').replace(/\/$/, '');
     }
 
     getPiWsUrl(): string {
-        return (this.settingsStorage.values.piWsUrl as string || 'ws://10.0.1.41:8766').replace(/\/$/, '');
+        return (this.settingsStorage.values.piWsUrl as string || 'ws://192.168.1.123:8766').replace(/\/$/, '');
+    }
+
+    getSyntheticRtspUrl(): string {
+        return (this.settingsStorage.values.syntheticRtspUrl as string || '').trim();
+    }
+
+    getSnapshotUrl(): string {
+        const configuredSnapshotUrl = (this.settingsStorage.values.snapshotUrl as string || '').trim();
+
+        if (configuredSnapshotUrl) {
+            return configuredSnapshotUrl;
+        }
+
+        return `${this.getPiBaseUrl()}/snapshot.jpg`;
     }
 
     async testPiHealth(): Promise<void> {
@@ -819,9 +445,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         this.piWs.onopen = () => {
             this.piWsConnected = true;
-            this.lastPiPong = Date.now();
             this.console.log(`Pi WebSocket connected: ${url}`);
-            this.startPiHeartbeat();
         };
 
         this.piWs.onmessage = (event: any) => {
@@ -836,7 +460,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             this.console.warn('Pi WebSocket closed');
             this.piWsConnected = false;
             this.piWs = undefined;
-            this.stopPiHeartbeat();
+
             this.rejectPendingWsCommands(new Error('Pi WebSocket closed'));
             this.schedulePiWsReconnect();
         };
@@ -877,41 +501,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         }, 3000);
     }
 
-    startPiHeartbeat() {
-        this.stopPiHeartbeat();
-
-        this.piHeartbeatTimer = setInterval(() => {
-            if (!this.piWs || !this.piWsConnected) {
-                return;
-            }
-
-            const ageMs = Date.now() - this.lastPiPong;
-
-            if (ageMs > 45000) {
-                this.console.warn(`Pi WebSocket heartbeat stale (${ageMs}ms), reconnecting`);
-                this.reconnectPiWebSocket();
-                return;
-            }
-
-            try {
-                this.piWs.send(JSON.stringify({
-                    type: 'ping',
-                    time: Date.now(),
-                }));
-            } catch (e) {
-                this.console.warn(`Pi WebSocket heartbeat send failed: ${e}`);
-                this.reconnectPiWebSocket();
-            }
-        }, 15000);
-    }
-
-    stopPiHeartbeat() {
-        if (this.piHeartbeatTimer) {
-            clearInterval(this.piHeartbeatTimer);
-            this.piHeartbeatTimer = undefined;
-        }
-    }
-
     handlePiWsMessage(raw: any) {
         const text = typeof raw === 'string' ? raw : raw?.toString?.() || '';
 
@@ -933,12 +522,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             return;
         }
 
-        if (event.type === 'pong') {
-            this.lastPiPong = Date.now();
-            this.console.log(`Pi agent pong: ${JSON.stringify(event)}`);
-            return;
-        }
-
         if (event.type === 'doorbell') {
             this.handleDoorbellEvent(event);
             return;
@@ -948,208 +531,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             // Compatibiliteit, mocht de Pi-agent later 'bell' sturen.
             this.handleDoorbellEvent(event);
             return;
-        }
-    }
-
-    private ulawDecodeSample(u: number): number {
-        u = ~u & 0xff;
-        const sign = u & 0x80;
-        const exponent = (u >> 4) & 0x07;
-        const mantissa = u & 0x0f;
-        let sample = ((mantissa << 3) + 0x84) << exponent;
-        sample -= 0x84;
-        return sign ? -sample : sample;
-    }
-
-    private makeChirpS16le48k(): { buffer: Buffer; reference8k: Float32Array; startMs: number } {
-        const outRate = 48000;
-        const refRate = 8000;
-
-        const startMs = 200;
-        const toneMs = 80;
-        const totalMs = 700;
-
-        const totalSamples = Math.floor(outRate * totalMs / 1000);
-        const startSample = Math.floor(outRate * startMs / 1000);
-        const toneSamples = Math.floor(outRate * toneMs / 1000);
-
-        const pcm = Buffer.alloc(totalSamples * 2);
-
-        for (let i = 0; i < toneSamples; i++) {
-            const t = i / outRate;
-            const p = i / toneSamples;
-
-            const f0 = 1200;
-            const f1 = 3200;
-            const freq = f0 + (f1 - f0) * p;
-
-            const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * p);
-            const sample = Math.sin(2 * Math.PI * freq * t) * window * 0.35;
-
-            const s16 = Math.max(-32767, Math.min(32767, Math.round(sample * 32767)));
-            pcm.writeInt16LE(s16, (startSample + i) * 2);
-        }
-
-        const refSamples = Math.floor(refRate * toneMs / 1000);
-        const reference8k = new Float32Array(refSamples);
-
-        for (let i = 0; i < refSamples; i++) {
-            const t = i / refRate;
-            const p = i / refSamples;
-
-            const f0 = 1200;
-            const f1 = 3200;
-            const freq = f0 + (f1 - f0) * p;
-
-            const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * p);
-            reference8k[i] = Math.sin(2 * Math.PI * freq * t) * window;
-        }
-
-        return { buffer: pcm, reference8k, startMs };
-    }
-
-    private findCorrelationPeak(signal: Float32Array, reference: Float32Array, minIndex = 0): number {
-        let bestIndex = minIndex;
-        let bestScore = -Infinity;
-
-        for (let i = minIndex; i <= signal.length - reference.length; i++) {
-            let score = 0;
-
-            for (let j = 0; j < reference.length; j++) {
-                score += signal[i + j] * reference[j];
-            }
-
-            const absScore = Math.abs(score);
-            if (absScore > bestScore) {
-                bestScore = absScore;
-                bestIndex = i;
-            }
-        }
-
-        return bestIndex;
-    }
-
-    async testAudioRoundtripLatency(): Promise<void> {
-        const piBaseUrl = this.getPiBaseUrl();
-        const session = `latency-${Date.now()}`;
-
-        const micUrl = `${piBaseUrl}/mic/ulaw?session=${encodeURIComponent(session)}`;
-        const speakerUrl = `${piBaseUrl}/speaker/raw`;
-
-        const sampleRate = 8000;
-        const recordMs = 5000;
-        const { buffer: tonePcm48k, reference8k, startMs } = this.makeChirpS16le48k();
-
-        this.console.log(`[latency] Starting roundtrip test`);
-        this.console.log(`[latency] Mic URL: ${micUrl}`);
-        this.console.log(`[latency] Speaker URL: ${speakerUrl}`);
-
-        // Kleine pauze om restanten van vorige test minder kans te geven.
-        await new Promise(resolve => setTimeout(resolve, 500));
-
-        const controller = new AbortController();
-        const chunks: Buffer[] = [];
-
-        const micPromise = (async () => {
-            const response = await fetch(micUrl, {
-                method: 'GET',
-                signal: controller.signal,
-            });
-
-            if (!response.ok || !response.body) {
-                throw new Error(`mic fetch failed: ${response.status} ${response.statusText}`);
-            }
-
-            const reader = response.body.getReader();
-
-            try {
-                while (true) {
-                    const result = await reader.read();
-
-                    if (result.done) {
-                        break;
-                    }
-
-                    if (result.value?.length) {
-                        chunks.push(Buffer.from(result.value));
-                    }
-                }
-            } catch {
-                // Expected when aborted after record window.
-            }
-        })();
-
-        // Geef /mic/ulaw even tijd om echt te streamen voordat de toon start.
-        await new Promise(resolve => setTimeout(resolve, 200));
-
-        const speakerStartedAt = Date.now();
-
-        const speakerPromise = fetch(speakerUrl, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/octet-stream',
-            },
-            body: tonePcm48k,
-        }).then(response => {
-            if (!response.ok) {
-                throw new Error(`speaker POST failed: ${response.status} ${response.statusText}`);
-            }
-            return response;
-        }).catch(e => {
-            this.console.warn(`[latency] speaker POST failed: ${e?.message || e}`);
-        });
-
-        this.console.log(`[latency] Speaker POST started at ${speakerStartedAt}`);
-
-        // Niet wachten op speakerPromise: /speaker/raw returned pas nadat alle audio verwerkt is.
-        await new Promise(resolve => setTimeout(resolve, recordMs));
-
-        controller.abort();
-
-        try {
-            await micPromise;
-        } catch {
-            // Ignore abort.
-        }
-
-        try {
-            await speakerPromise;
-        } catch {
-            // Already logged above.
-        }
-
-        const ulaw = Buffer.concat(chunks);
-
-        this.console.log(`[latency] Captured ${ulaw.length} ulaw bytes`);
-
-        if (ulaw.length < sampleRate) {
-            this.console.warn(`[latency] Too little audio captured. Is /mic/ulaw streaming?`);
-            return;
-        }
-
-        const signal = new Float32Array(ulaw.length);
-
-        for (let i = 0; i < ulaw.length; i++) {
-            signal[i] = this.ulawDecodeSample(ulaw[i]) / 32768;
-        }
-
-        // Zoek niet vóór de verwachte speelstart; dat voorkomt oude/valse pieken.
-        const minSearchMs = startMs + 20;
-        const minSearchIndex = Math.floor(sampleRate * minSearchMs / 1000);
-
-        const peak = this.findCorrelationPeak(signal, reference8k, minSearchIndex);
-
-        const detectedMs = peak / sampleRate * 1000;
-        const latencyMs = detectedMs - startMs;
-
-        this.console.log(`[latency] Detected tone at ${detectedMs.toFixed(1)} ms`);
-        this.console.log(`[latency] Playback tone started at ${startMs.toFixed(1)} ms`);
-        this.console.log(`[latency] Estimated audio roundtrip latency: ${latencyMs.toFixed(1)} ms`);
-
-        if (latencyMs < 0) {
-            this.console.warn(`[latency] Negative latency: likely false detection or old buffered audio.`);
-        } else if (latencyMs > 1000) {
-            this.console.warn(`[latency] High latency detected. This may be buffered audio or a delayed /mic/ulaw path.`);
         }
     }
 
@@ -1245,44 +626,36 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async unlockDoor(): Promise<void> {
-        const url = `${this.getPiBaseUrl()}/unlock`;
-
-        this.console.log(`Unlocking via Pi HTTP primary: ${url}`);
+        this.console.log('Unlocking via Pi WebSocket');
 
         try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 4000);
+            const response = await this.sendPiWsCommand({
+                type: 'unlock',
+            }, 'unlock');
 
-            try {
-                const response = await fetch(url, {
-                    method: 'POST',
-                    signal: controller.signal,
-                });
-
-                const body = await response.text();
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status} ${response.statusText}: ${body}`);
-                }
-
-                this.console.log(`Unlock OK via HTTP: ${body}`);
-                return;
-            } finally {
-                clearTimeout(timeout);
-            }
+            this.console.log(`Unlock OK via WebSocket: ${JSON.stringify(response)}`);
+            return;
         } catch (e) {
-            this.console.warn(`Unlock via HTTP failed, falling back to WebSocket: ${e}`);
+            this.console.warn(`Unlock via WebSocket failed, falling back to HTTP: ${e}`);
         }
 
-        const response = await this.sendPiWsCommand({
-            type: 'unlock',
-        }, 'unlock');
+        const url = `${this.getPiBaseUrl()}/unlock`;
+        this.console.log(`Unlocking via Pi HTTP fallback: ${url}`);
 
-        this.console.log(`Unlock OK via WebSocket fallback: ${JSON.stringify(response)}`);
+        const response = await fetch(url, {
+            method: 'POST',
+        });
+
+        if (!response.ok) {
+            throw new Error(`Unlock failed: ${response.status} ${response.statusText}`);
+        }
+
+        const body = await response.text();
+        this.console.log(`Unlock OK via HTTP: ${body}`);
     }
 
-    // most cameras have motion and doorbell press events, but dont notify when the event ends.
-    // so set a timeout ourselves to reset the state.
+    // Most cameras have doorbell press events, but don't notify when the event ends.
+    // So set a timeout ourselves to reset the state.
     triggerBinaryState() {
         this.console.log('Golmar doorbell pressed');
         this.binaryState = true;
@@ -1293,8 +666,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         }, 1000);
     }
 
-    // most cameras have motion events, but dont notify when the event ends.
-    // so set a timeout ourselves to reset the state.
+    // Most cameras have motion events, but don't notify when the event ends.
+    // So set a timeout ourselves to reset the state.
     triggerMotion() {
         this.console.log('Golmar motion detected');
         this.motionDetected = true;
@@ -1306,36 +679,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 }
 
-class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
-    constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
-        super(nativeId);
-
-        // De Golmar opener is momentary; normaal is hij dus "locked".
-        this.lockState = LockState.Locked;
-    }
-
-    async unlock(): Promise<void> {
-        this.console.log('HomeKit requested unlock');
-
-        const intercom = await this.plugin.getDevice('golmar-intercom') as GolmarCameraDevice;
-        await intercom.unlockDoor();
-
-        this.lockState = LockState.Unlocked;
-
-        setTimeout(() => {
-            this.lockState = LockState.Locked;
-        }, 2000);
-    }
-
-    async lock(): Promise<void> {
-        // De fysieke opener kan niet actief "locken"; hij stopt vanzelf.
-        this.console.log('HomeKit requested lock; Golmar opener is momentary, setting state to locked.');
-        this.lockState = LockState.Locked;
-    }
-}
-
 class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, DeviceCreator {
-    devices = new Map<string, ScryptedDeviceBase>();
+    devices = new Map<string, GolmarCameraDevice>();
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -1411,68 +756,44 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
     async syncDevices(duration: number) {
         await this.tryLogin();
 
-        const intercomNativeId = 'golmar-intercom';
-        const lockNativeId = 'golmar-lock';
+        const nativeId = 'golmar-intercom';
 
-        const intercomInterfaces = [
-        ScryptedInterface.Camera,
-        ScryptedInterface.VideoCamera,
-        ScryptedInterface.MotionSensor,
-        ScryptedInterface.BinarySensor,
-        ScryptedInterface.Intercom,
-        ScryptedInterface.Settings,
-        ];
-
-        const lockInterfaces = [
-        ScryptedInterface.Lock,
+        const interfaces = [
+            ScryptedInterface.Camera,
+            ScryptedInterface.VideoCamera,
+            ScryptedInterface.MotionSensor,
+            ScryptedInterface.BinarySensor,
+            ScryptedInterface.Intercom,
+            ScryptedInterface.Settings,
         ];
 
         const devices: Device[] = [
-        {
-            info: {
-            model: '4+n Analog Intercom',
-            manufacturer: 'Golmar',
-            },
-            nativeId: intercomNativeId,
-            name: 'Golmar Intercom',
-            type: ScryptedDeviceType.Doorbell,
-            interfaces: intercomInterfaces,
-        },
-        {
-            info: {
-            model: 'Door Opener',
-            manufacturer: 'Golmar',
-            },
-            nativeId: lockNativeId,
-            name: 'Golmar Door Lock',
-            type: ScryptedDeviceType.Lock,
-            interfaces: lockInterfaces,
-        },
+            {
+                info: {
+                    model: '4+n Analog Intercom',
+                    manufacturer: 'Golmar',
+                },
+                nativeId,
+                name: 'Golmar Intercom',
+                type: ScryptedDeviceType.Doorbell,
+                interfaces,
+            }
         ];
 
         await deviceManager.onDevicesChanged({
-        devices,
+            devices,
         });
 
-        this.console.log('discovered Golmar Intercom doorbell and lock devices');
-
+        this.console.log('discovered Golmar Intercom doorbell device');
     }
 
     async getDevice(nativeId: string) {
-    if (!this.devices.has(nativeId)) {
-        let device: ScryptedDeviceBase;
-
-        if (nativeId === 'golmar-lock') {
-        device = new GolmarLockDevice(this, nativeId);
-        }
-        else {
-        device = new GolmarCameraDevice(this, nativeId);
+        if (!this.devices.has(nativeId)) {
+            const camera = new GolmarCameraDevice(this, nativeId);
+            this.devices.set(nativeId, camera);
         }
 
-        this.devices.set(nativeId, device);
-    }
-
-    return this.devices.get(nativeId);
+        return this.devices.get(nativeId);
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {

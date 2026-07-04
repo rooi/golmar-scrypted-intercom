@@ -7,6 +7,8 @@ import {
     DeviceProvider,
     FFmpegInput,
     Intercom,
+    Lock,
+    LockState,
     MediaObject,
     MediaStreamOptions,
     MotionSensor,
@@ -19,7 +21,7 @@ import {
     Setting,
     Settings,
     SettingValue,
-    VideoCamera
+    VideoCamera,
 } from '@scrypted/sdk';
 
 import sdk from '@scrypted/sdk';
@@ -679,8 +681,36 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 }
 
+class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
+    constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
+        super(nativeId);
+
+        // De Golmar opener is momentary; normaal is hij dus "locked".
+        this.lockState = LockState.Locked;
+    }
+
+    async unlock(): Promise<void> {
+        this.console.log('HomeKit requested unlock');
+
+        const intercom = await this.plugin.getDevice('golmar-intercom') as GolmarCameraDevice;
+        await intercom.unlockDoor();
+
+        this.lockState = LockState.Unlocked;
+
+        setTimeout(() => {
+            this.lockState = LockState.Locked;
+        }, 2000);
+    }
+
+    async lock(): Promise<void> {
+        // De fysieke opener kan niet actief "locken"; hij stopt vanzelf.
+        this.console.log('HomeKit requested lock; Golmar opener is momentary, setting state to locked.');
+        this.lockState = LockState.Locked;
+    }
+}
+
 class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, DeviceCreator {
-    devices = new Map<string, GolmarCameraDevice>();
+    devices = new Map<string, ScryptedDeviceBase>();
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -756,9 +786,10 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
     async syncDevices(duration: number) {
         await this.tryLogin();
 
-        const nativeId = 'golmar-intercom';
+        const intercomNativeId = 'golmar-intercom';
+        const lockNativeId = 'golmar-lock';
 
-        const interfaces = [
+        const intercomInterfaces = [
             ScryptedInterface.Camera,
             ScryptedInterface.VideoCamera,
             ScryptedInterface.MotionSensor,
@@ -767,30 +798,52 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             ScryptedInterface.Settings,
         ];
 
+        const lockInterfaces = [
+            ScryptedInterface.Lock,
+        ];
+
         const devices: Device[] = [
             {
                 info: {
                     model: '4+n Analog Intercom',
                     manufacturer: 'Golmar',
                 },
-                nativeId,
+                nativeId: intercomNativeId,
                 name: 'Golmar Intercom',
                 type: ScryptedDeviceType.Doorbell,
-                interfaces,
-            }
+                interfaces: intercomInterfaces,
+            },
+            {
+                info: {
+                    model: 'Door Opener',
+                    manufacturer: 'Golmar',
+                },
+                nativeId: lockNativeId,
+                name: 'Golmar Door Lock',
+                type: ScryptedDeviceType.Lock,
+                interfaces: lockInterfaces,
+            },
         ];
 
         await deviceManager.onDevicesChanged({
             devices,
         });
 
-        this.console.log('discovered Golmar Intercom doorbell device');
+        this.console.log('discovered Golmar Intercom doorbell and lock devices');
     }
 
     async getDevice(nativeId: string) {
         if (!this.devices.has(nativeId)) {
-            const camera = new GolmarCameraDevice(this, nativeId);
-            this.devices.set(nativeId, camera);
+            let device: ScryptedDeviceBase;
+
+            if (nativeId === 'golmar-lock') {
+                device = new GolmarLockDevice(this, nativeId);
+            }
+            else {
+                device = new GolmarCameraDevice(this, nativeId);
+            }
+
+            this.devices.set(nativeId, device);
         }
 
         return this.devices.get(nativeId);

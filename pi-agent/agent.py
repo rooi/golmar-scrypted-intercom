@@ -111,7 +111,7 @@ AUDIO_RELAY_SETTLE_SECONDS = 0.10
 UNLOCK_SOUND_ENABLED = True
 UNLOCK_SOUND_FILE = "/home/pi/golmar-scrypted-intercom/pi-agent/audio/unlock.wav"
 UNLOCK_SOUND_VOLUME = "1.0"
-UNLOCK_SOUND_TIMEOUT_SECONDS = 5
+UNLOCK_SOUND_TIMEOUT_SECONDS = 8
 
 audio_relay_lock = threading.Lock()
 audio_relay_users = 0

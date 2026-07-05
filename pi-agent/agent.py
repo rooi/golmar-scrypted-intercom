@@ -189,7 +189,7 @@ AUDIO_RELAY_SETTLE_SECONDS = 0.10
 # Pas dit pad aan naar jouw bestand. ffmpeg mag wav/mp3/m4a/etc. lezen.
 UNLOCK_SOUND_ENABLED = True
 UNLOCK_SOUND_FILE = "/home/pi/golmar-scrypted-intercom/pi-agent/audio/unlock.wav"
-UNLOCK_SOUND_VOLUME = "1.0"
+UNLOCK_SOUND_VOLUME = "5.0"
 UNLOCK_SOUND_TIMEOUT_SECONDS = 8
 
 audio_relay_lock = threading.Lock()

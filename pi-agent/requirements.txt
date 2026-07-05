@@ -1,2 +1,6 @@
 flask
 websockets
+flask
+websockets
+automationhat
+gpiod

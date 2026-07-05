@@ -12,6 +12,7 @@ import {
     MediaObject,
     MediaStreamOptions,
     MotionSensor,
+    OnOff,
     PictureOptions,
     ResponseMediaStreamOptions,
     ScryptedDeviceBase,
@@ -30,6 +31,11 @@ import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
 const { deviceManager, mediaManager } = sdk;
+
+const GOLMAR_INTERCOM_NATIVE_ID = 'golmar-intercom';
+const PACKAGE_MODE_NATIVE_ID = 'golmar-package-mode';
+
+const PACKAGE_MODE_DURATION_MS = 8 * 60 * 60 * 1000;
 
 type PendingWsCommand = {
     expectedType: string;
@@ -310,6 +316,12 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
                 type: 'button',
             },
             {
+                key: 'packageUnlockDoor',
+                title: 'Package Unlock Door',
+                description: 'Call the Pi agent /package-unlock endpoint.',
+                type: 'button',
+            },
+            {
                 key: 'testPiHealth',
                 title: 'Test Pi Agent HTTP',
                 description: 'Check whether the Scrypted plugin can reach the Pi agent over HTTP.',
@@ -345,6 +357,11 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         if (key === 'unlockDoor') {
             await this.unlockDoor();
+            return;
+        }
+
+        if (key === 'packageUnlockDoor') {
+           await this.packageUnlockDoor();
             return;
         }
 
@@ -538,20 +555,25 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
     handleDoorbellEvent(event: any) {
         const pressed = !!event.pressed;
-
         this.console.log(`Golmar doorbell event: pressed=${pressed}, voltage=${event.voltage}`);
 
         if (pressed) {
             this.binaryState = true;
 
+            // Pakketmodus wordt alleen op een echte "pressed=true" deurbel-event geëvalueerd.
+            // Niet awaiten: deurbel-state en HomeKit responsiveness blijven snel.
+            void this.plugin.handlePackageModeDoorbell(this).catch(e => {
+            this.console.error(`Package mode doorbell handling failed: ${e}`);
+            });
+
             if (this.lastDoorbellResetTimer) {
-                clearTimeout(this.lastDoorbellResetTimer);
+            clearTimeout(this.lastDoorbellResetTimer);
             }
 
             this.lastDoorbellResetTimer = setTimeout(() => {
-                this.console.log('Golmar doorbell auto release');
-                this.binaryState = false;
-                this.lastDoorbellResetTimer = undefined;
+            this.console.log('Golmar doorbell auto release');
+            this.binaryState = false;
+            this.lastDoorbellResetTimer = undefined;
             }, 3000);
 
             return;
@@ -662,10 +684,32 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.console.log('Golmar doorbell pressed');
         this.binaryState = true;
 
+        void this.plugin.handlePackageModeDoorbell(this).catch(e => {
+            this.console.error(`Package mode simulated doorbell handling failed: ${e}`);
+        });
+
         setTimeout(() => {
             this.console.log('Golmar doorbell released');
             this.binaryState = false;
         }, 1000);
+    }
+
+    async packageUnlockDoor(): Promise<void> {
+        const url = `${this.getPiBaseUrl()}/package-unlock`;
+
+        this.console.log(`Package unlock via Pi HTTP: ${url}`);
+
+        const response = await fetch(url, {
+            method: 'POST',
+        });
+
+        const body = await response.text();
+
+        if (!response.ok) {
+            throw new Error(`Package unlock failed: ${response.status} ${response.statusText}: ${body}`);
+        }
+
+        this.console.log(`Package unlock OK via HTTP: ${body}`);
     }
 
     // Most cameras have motion events, but don't notify when the event ends.
@@ -692,7 +736,7 @@ class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
     async unlock(): Promise<void> {
         this.console.log('HomeKit requested unlock');
 
-        const intercom = await this.plugin.getDevice('golmar-intercom') as GolmarCameraDevice;
+        const intercom = await this.plugin.getDevice(GOLMAR_INTERCOM_NATIVE_ID) as GolmarCameraDevice;
         await intercom.unlockDoor();
 
         this.lockState = LockState.Unlocked;
@@ -709,8 +753,30 @@ class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
     }
 }
 
+class GolmarPackageModeSwitch extends ScryptedDeviceBase implements OnOff {
+    constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
+        super(nativeId);
+        this.refreshState();
+    }
+
+    refreshState() {
+        this.on = this.plugin.isPackageModeEnabled();
+    }
+
+    async turnOn(): Promise<void> {
+        await this.plugin.setPackageMode(true, 'homekit');
+    }
+
+    async turnOff(): Promise<void> {
+        await this.plugin.setPackageMode(false, 'homekit');
+    }
+}
+
 class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, DeviceCreator {
-    devices = new Map<string, ScryptedDeviceBase>();
+    devices = new Map<string, any>();
+
+    private packageModeExpiryTimer: any;
+    private packageUnlockInFlight = false;
 
     settingsStorage = new StorageSettings(this, {
         email: {
@@ -736,6 +802,7 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
     constructor() {
         super();
         this.syncDevices(0);
+        this.schedulePackageModeExpiryFromStorage();
     }
 
     async getCreateDeviceSettings(): Promise<Setting[]> {
@@ -786,9 +853,6 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
     async syncDevices(duration: number) {
         await this.tryLogin();
 
-        const intercomNativeId = 'golmar-intercom';
-        const lockNativeId = 'golmar-lock';
-
         const intercomInterfaces = [
             ScryptedInterface.Camera,
             ScryptedInterface.VideoCamera,
@@ -808,7 +872,7 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
                     model: '4+n Analog Intercom',
                     manufacturer: 'Golmar',
                 },
-                nativeId: intercomNativeId,
+                nativeId: GOLMAR_INTERCOM_NATIVE_ID,
                 name: 'Golmar Intercom',
                 type: ScryptedDeviceType.Doorbell,
                 interfaces: intercomInterfaces,
@@ -818,10 +882,22 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
                     model: 'Door Opener',
                     manufacturer: 'Golmar',
                 },
-                nativeId: lockNativeId,
+                nativeId: 'golmar-lock',
                 name: 'Golmar Door Lock',
                 type: ScryptedDeviceType.Lock,
                 interfaces: lockInterfaces,
+            },
+            {
+                info: {
+                    model: 'Package Mode Switch',
+                    manufacturer: 'Golmar',
+                },
+                nativeId: PACKAGE_MODE_NATIVE_ID,
+                name: 'Pakketmodus',
+                type: ScryptedDeviceType.Switch,
+                interfaces: [
+                    ScryptedInterface.OnOff,
+                ],
             },
         ];
 
@@ -829,18 +905,24 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             devices,
         });
 
-        this.console.log('discovered Golmar Intercom doorbell and lock devices');
+        this.console.log('discovered Golmar Intercom doorbell, lock device and Pakketmodus switch');
     }
 
     async getDevice(nativeId: string) {
         if (!this.devices.has(nativeId)) {
             let device: ScryptedDeviceBase;
 
-            if (nativeId === 'golmar-lock') {
+            if (nativeId === GOLMAR_INTERCOM_NATIVE_ID) {
+                device = new GolmarCameraDevice(this, nativeId);
+            }
+            else if (nativeId === 'golmar-lock') {
                 device = new GolmarLockDevice(this, nativeId);
             }
+            else if (nativeId === PACKAGE_MODE_NATIVE_ID) {
+                device = new GolmarPackageModeSwitch(this, nativeId);
+            }
             else {
-                device = new GolmarCameraDevice(this, nativeId);
+                throw new Error(`Unknown nativeId: ${nativeId}`);
             }
 
             this.devices.set(nativeId, device);
@@ -854,6 +936,153 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
 
         if (device) {
             this.devices.delete(nativeId);
+        }
+    }
+
+    getPackageModeExpiresAt(): number {
+        return Number(this.storage.getItem('packageModeExpiresAt') || '0');
+    }
+
+    isPackageModeEnabled(): boolean {
+        const enabled = this.storage.getItem('packageMode') === 'true';
+
+        if (!enabled) {
+            return false;
+        }
+
+        const expiresAt = this.getPackageModeExpiresAt();
+
+        if (expiresAt > 0 && Date.now() >= expiresAt) {
+            this.console.log('Package mode expired while checking state');
+            void this.setPackageMode(false, 'expired');
+            return false;
+        }
+
+        return true;
+    }
+
+    isPackageModeUsed(): boolean {
+        return this.storage.getItem('packageModeUsed') === 'true';
+    }
+
+    getPackageModeSwitch(): GolmarPackageModeSwitch | undefined {
+        const device = this.devices.get(PACKAGE_MODE_NATIVE_ID);
+
+        if (device instanceof GolmarPackageModeSwitch) {
+            return device;
+        }
+
+        return undefined;
+    }
+
+    updatePackageModeSwitchState() {
+        const packageSwitch = this.getPackageModeSwitch();
+
+        if (packageSwitch) {
+            packageSwitch.on = this.isPackageModeEnabled();
+        }
+    }
+
+    async setPackageMode(enabled: boolean, reason: string): Promise<void> {
+        if (enabled) {
+            const expiresAt = Date.now() + PACKAGE_MODE_DURATION_MS;
+
+            this.storage.setItem('packageMode', 'true');
+            this.storage.setItem('packageModeUsed', 'false');
+            this.storage.setItem('packageModeExpiresAt', expiresAt.toString());
+
+            this.console.log(
+            `Package mode enabled by ${reason}, expiresAt=${new Date(expiresAt).toISOString()}`
+            );
+
+            this.schedulePackageModeExpiry(expiresAt);
+        }
+        else {
+            this.storage.setItem('packageMode', 'false');
+            this.storage.setItem('packageModeUsed', 'false');
+            this.storage.setItem('packageModeExpiresAt', '0');
+
+            if (this.packageModeExpiryTimer) {
+            clearTimeout(this.packageModeExpiryTimer);
+            this.packageModeExpiryTimer = undefined;
+            }
+
+            this.console.log(`Package mode disabled by ${reason}`);
+        }
+
+        this.updatePackageModeSwitchState();
+    }
+
+    schedulePackageModeExpiryFromStorage() {
+        if (!this.isPackageModeEnabled()) {
+            return;
+        }
+
+        const expiresAt = this.getPackageModeExpiresAt();
+
+        if (expiresAt > 0) {
+            this.schedulePackageModeExpiry(expiresAt);
+        }
+    }
+
+    schedulePackageModeExpiry(expiresAt: number) {
+        if (this.packageModeExpiryTimer) {
+            clearTimeout(this.packageModeExpiryTimer);
+            this.packageModeExpiryTimer = undefined;
+        }
+
+        const delay = Math.max(0, expiresAt - Date.now());
+
+        this.packageModeExpiryTimer = setTimeout(() => {
+            this.packageModeExpiryTimer = undefined;
+
+            this.console.log('Package mode automatically expired after 8 hours');
+
+            void this.setPackageMode(false, 'expiry-timer').catch(e => {
+            this.console.error(`Failed to disable expired package mode: ${e}`);
+            });
+        }, delay);
+    }
+
+    async handlePackageModeDoorbell(camera: GolmarCameraDevice): Promise<void> {
+        if (this.packageUnlockInFlight) {
+            this.console.warn('Package mode ignored: package unlock already in flight');
+            return;
+        }
+
+        if (!this.isPackageModeEnabled()) {
+            return;
+        }
+
+        if (this.isPackageModeUsed()) {
+            this.console.warn('Package mode ignored: already used');
+            return;
+        }
+
+        this.packageUnlockInFlight = true;
+
+        // Consumeer pakketmodus vóór de HTTP-call.
+        // Dit voorkomt dubbele opens als er meerdere doorbell-events of timeouts zijn.
+        this.storage.setItem('packageModeUsed', 'true');
+
+        try {
+            this.console.log('Package mode doorbell accepted: calling /package-unlock');
+
+            await camera.packageUnlockDoor();
+
+            this.console.log('Package mode unlock completed; disabling package mode');
+
+            await this.setPackageMode(false, 'used');
+        }
+        catch (e) {
+            this.console.error(`Package mode unlock failed or was rejected: ${e}`);
+
+            // Veiligheidskeuze: ook bij fout package mode uitzetten.
+            // Als de Pi wel opende maar de response faalde, voorkom je een tweede poging.
+            await this.setPackageMode(false, 'package-unlock-error');
+        }
+        finally {
+            this.packageUnlockInFlight = false;
         }
     }
 }

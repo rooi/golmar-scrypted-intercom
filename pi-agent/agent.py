@@ -189,6 +189,10 @@ MIC_OUTPUT_CHANNELS = "1"
 AUDIO_RELAY_ENABLED = False
 AUDIO_RELAY_SETTLE_SECONDS = 0.10
 
+MIC_STARTUP_GRACE_SECONDS = 8.0
+MIC_STALL_SECONDS = 3.0
+MIC_SELECT_POLL_SECONDS = 0.5
+
 # Audiobestand dat na een unlock afgespeeld wordt.
 # Pas dit pad aan naar jouw bestand. ffmpeg mag wav/mp3/m4a/etc. lezen.
 UNLOCK_SOUND_ENABLED = True
@@ -637,7 +641,6 @@ def mic_ulaw():
         total_bytes = 0
         started = time.monotonic()
         last_bytes = started
-        no_data_timeout = 2.0
 
         try:
             while True:
@@ -647,18 +650,40 @@ def mic_ulaw():
                         flush=True,
                     )
                     break
-
-                ready, _, _ = select.select([process.stdout], [], [], no_data_timeout)
-
+                    
+                ready, _, _ = select.select(
+                    [process.stdout],
+                    [],
+                    [],
+                    MIC_SELECT_POLL_SECONDS,
+                )
+                
                 if not ready:
-                    elapsed = time.monotonic() - started
-                    since_last = time.monotonic() - last_bytes
-                    print(
-                        f"mic μ-law ffmpeg stalled: no stdout for {since_last:.1f}s, "
-                        f"elapsed={elapsed:.1f}s, total_bytes={total_bytes}, killing pid={process.pid}",
-                        flush=True,
-                    )
-                    break
+                    now = time.monotonic()
+                    elapsed = now - started
+                    since_last = now - last_bytes
+                
+                    if total_bytes == 0:
+                        # Eerste startup: ffmpeg/ALSA/USB-audio krijgt langer de tijd.
+                        if elapsed > MIC_STARTUP_GRACE_SECONDS:
+                            print(
+                                f"mic μ-law ffmpeg startup timeout: no stdout for {elapsed:.1f}s, "
+                                f"total_bytes={total_bytes}, killing pid={process.pid}",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        # Na de eerste bytes: dan is een echte stall verdacht.
+                        if since_last > MIC_STALL_SECONDS:
+                            print(
+                                f"mic μ-law ffmpeg stalled after audio started: "
+                                f"no stdout for {since_last:.1f}s, total_bytes={total_bytes}, "
+                                f"killing pid={process.pid}",
+                                flush=True,
+                            )
+                            break
+                
+                    continue
 
                 # 160 bytes = 20 ms bij μ-law 8000 Hz.
                 # Dit houden we bewust klein voor lage latency.

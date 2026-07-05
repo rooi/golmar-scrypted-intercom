@@ -12,8 +12,11 @@ from flask import Flask, jsonify, request, Response
 
 import websockets
 
+import sys
 
-PYTHON = "/home/pi/venvs/automationhat/bin/python"
+BASE_DIR = Path(__file__).resolve().parent
+
+PYTHON = sys.executable
 
 HTTP_PORT = 8765
 WS_PORT = 8766
@@ -188,7 +191,7 @@ AUDIO_RELAY_SETTLE_SECONDS = 0.10
 # Audiobestand dat na een unlock afgespeeld wordt.
 # Pas dit pad aan naar jouw bestand. ffmpeg mag wav/mp3/m4a/etc. lezen.
 UNLOCK_SOUND_ENABLED = True
-UNLOCK_SOUND_FILE = "/home/pi/golmar-scrypted-intercom/pi-agent/audio/unlock.wav"
+UNLOCK_SOUND_FILE = str(BASE_DIR / "audio" / "unlock.wav")
 UNLOCK_SOUND_VOLUME = "5.0"
 UNLOCK_SOUND_TIMEOUT_SECONDS = 8
 
@@ -1135,8 +1138,6 @@ def read_doorbell_loop(loop):
     global doorbell_pressed, doorbell_voltage, last_doorbell_event
 
     import sys
-    sys.path.insert(0, "/home/pi/venvs/automationhat/lib/python3.13/site-packages")
-
     import automationhat
 
     last_pressed = None

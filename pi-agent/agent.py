@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request, Response
 import websockets
 
 import sys
+from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 

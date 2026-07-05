@@ -104,7 +104,7 @@ sudo apt install -y \
   alsa-utils \
   gpiod \
   libgpiod-dev \
-  python3-gpiod
+  python3-libgpiod
 ```
 
 Check that audio tools are available:

@@ -24,6 +24,10 @@ doorbell_voltage = 0.0
 last_doorbell_event = None
 unlock_lock = threading.Lock()
 
+PACKAGE_UNLOCK_COOLDOWN_SECONDS = 60
+package_unlock_lock = threading.Lock()
+last_package_unlock_time = 0.0
+
 # Deze waarde werkte bij jou blijkbaar al.
 # Eventueel later tunen als hij te gevoelig of juist niet gevoelig genoeg is.
 doorbell_threshold = 0.25
@@ -35,6 +39,15 @@ app = Flask(__name__)
 
 @app.get("/health")
 def health():
+    package_unlock_remaining_seconds = (
+        max(
+            0,
+            int(PACKAGE_UNLOCK_COOLDOWN_SECONDS - (time.time() - last_package_unlock_time))
+        )
+        if last_package_unlock_time
+        else 0
+    )
+
     return jsonify({
         "ok": True,
         "name": "golmar-pi-agent",
@@ -45,25 +58,91 @@ def health():
         "threshold": doorbell_threshold,
         "ws_clients": len(clients),
         "last_doorbell_event": last_doorbell_event,
+        "package_unlock": {
+            "cooldown_seconds": PACKAGE_UNLOCK_COOLDOWN_SECONDS,
+            "last_package_unlock_time": last_package_unlock_time or None,
+            "remaining_seconds": package_unlock_remaining_seconds,
+            "cooldown_active": package_unlock_remaining_seconds > 0,
+        },
         "time": time.time(),
     })
-
 
 @app.post("/unlock")
 def unlock_http():
     try:
+        print("HTTP unlock requested", flush=True)
+
         unlock_door()
+
         return jsonify({
             "ok": True,
             "action": "unlock",
+            "reason": "manual",
+            "time": time.time(),
         })
+
     except Exception as e:
+        print("HTTP unlock failed:", repr(e), flush=True)
+
         return jsonify({
             "ok": False,
             "action": "unlock",
+            "reason": "manual",
             "error": str(e),
+            "time": time.time(),
         }), 500
 
+@app.post("/package-unlock")
+def package_unlock_http():
+    global last_package_unlock_time
+
+    with package_unlock_lock:
+        now = time.time()
+        elapsed = now - last_package_unlock_time
+        remaining = max(0, int(PACKAGE_UNLOCK_COOLDOWN_SECONDS - elapsed))
+
+        if elapsed < PACKAGE_UNLOCK_COOLDOWN_SECONDS:
+            print(
+                f"Package unlock ignored: cooldown active, remaining={remaining}s",
+                flush=True,
+            )
+
+            return jsonify({
+                "ok": False,
+                "action": "package-unlock",
+                "reason": "cooldown",
+                "cooldown_seconds": PACKAGE_UNLOCK_COOLDOWN_SECONDS,
+                "remaining_seconds": remaining,
+                "time": now,
+            }), 429
+
+        try:
+            print("Package unlock requested", flush=True)
+
+            unlock_door()
+
+            last_package_unlock_time = time.time()
+
+            print("Package unlock completed", flush=True)
+
+            return jsonify({
+                "ok": True,
+                "action": "package-unlock",
+                "reason": "package",
+                "cooldown_seconds": PACKAGE_UNLOCK_COOLDOWN_SECONDS,
+                "time": last_package_unlock_time,
+            })
+
+        except Exception as e:
+            print("Package unlock failed:", repr(e), flush=True)
+
+            return jsonify({
+                "ok": False,
+                "action": "package-unlock",
+                "reason": "error",
+                "error": str(e),
+                "time": time.time(),
+            }), 500
 
 def unlock_door():
     """

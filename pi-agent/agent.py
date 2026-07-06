@@ -164,7 +164,7 @@ def unlock_door():
             (
                 "import automationhat, time; "
                 "automationhat.output.one.on(); "
-                "time.sleep(1); "
+                "time.sleep(2); "
                 "automationhat.output.one.off()"
             )
         ], check=True, timeout=3)

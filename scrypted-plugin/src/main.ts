@@ -26,13 +26,14 @@ import {
 } from '@scrypted/sdk';
 
 import sdk from '@scrypted/sdk';
-import { StorageSettings } from "@scrypted/sdk/storage-settings"
+import { StorageSettings } from '@scrypted/sdk/storage-settings';
 
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 
 const { deviceManager, mediaManager } = sdk;
 
 const GOLMAR_INTERCOM_NATIVE_ID = 'golmar-intercom';
+const GOLMAR_LOCK_NATIVE_ID = 'golmar-lock';
 const PACKAGE_MODE_NATIVE_ID = 'golmar-package-mode';
 
 const PACKAGE_MODE_DURATION_MS = 8 * 60 * 60 * 1000;
@@ -43,6 +44,75 @@ type PendingWsCommand = {
     reject: (error: Error) => void;
     timeout: any;
 };
+
+type ExternalAlarmState =
+    | 'disarmed'
+    | 'armed_home'
+    | 'armed_away'
+    | 'armed_night'
+    | 'armed_vacation'
+    | 'armed_custom_bypass'
+    | 'pending'
+    | 'arming'
+    | 'disarming'
+    | 'triggered'
+    | 'unavailable'
+    | 'unknown';
+
+type DoorbellPresenceMode =
+    | 'normal'
+    | 'home'
+    | 'away'
+    | 'night'
+    | 'alarm'
+    | 'unknown';
+
+function normalizeAlarmState(raw: any): ExternalAlarmState {
+    const value = String(raw || '').trim().toLowerCase();
+
+    switch (value) {
+        case 'disarmed':
+        case 'armed_home':
+        case 'armed_away':
+        case 'armed_night':
+        case 'armed_vacation':
+        case 'armed_custom_bypass':
+        case 'pending':
+        case 'arming':
+        case 'disarming':
+        case 'triggered':
+        case 'unavailable':
+        case 'unknown':
+            return value as ExternalAlarmState;
+
+        default:
+            return 'unknown';
+    }
+}
+
+function alarmStateToDoorbellPresenceMode(state: ExternalAlarmState): DoorbellPresenceMode {
+    switch (state) {
+        case 'armed_home':
+            return 'home';
+
+        case 'armed_away':
+        case 'armed_vacation':
+        case 'armed_custom_bypass':
+            return 'away';
+
+        case 'armed_night':
+            return 'night';
+
+        case 'triggered':
+            return 'alarm';
+
+        case 'disarmed':
+            return 'normal';
+
+        default:
+            return 'unknown';
+    }
+}
 
 class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, MotionSensor, BinarySensor, Settings {
     settingsStorage = new StorageSettings(this, {
@@ -361,7 +431,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         }
 
         if (key === 'packageUnlockDoor') {
-           await this.packageUnlockDoor();
+            await this.packageUnlockDoor();
             return;
         }
 
@@ -555,25 +625,27 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
     handleDoorbellEvent(event: any) {
         const pressed = !!event.pressed;
-        this.console.log(`Golmar doorbell event: pressed=${pressed}, voltage=${event.voltage}`);
+
+        this.console.log(
+            `Golmar doorbell event: pressed=${pressed}, voltage=${event.voltage}, ` +
+            `alarmState=${this.plugin.getExternalAlarmState()}, mode=${this.plugin.getDoorbellPresenceMode()}`
+        );
 
         if (pressed) {
             this.binaryState = true;
 
-            // Pakketmodus wordt alleen op een echte "pressed=true" deurbel-event geëvalueerd.
-            // Niet awaiten: deurbel-state en HomeKit responsiveness blijven snel.
-            void this.plugin.handlePackageModeDoorbell(this).catch(e => {
-            this.console.error(`Package mode doorbell handling failed: ${e}`);
+            void this.handlePressedDoorbell().catch(e => {
+                this.console.error(`Doorbell pressed handling failed: ${e}`);
             });
 
             if (this.lastDoorbellResetTimer) {
-            clearTimeout(this.lastDoorbellResetTimer);
+                clearTimeout(this.lastDoorbellResetTimer);
             }
 
             this.lastDoorbellResetTimer = setTimeout(() => {
-            this.console.log('Golmar doorbell auto release');
-            this.binaryState = false;
-            this.lastDoorbellResetTimer = undefined;
+                this.console.log('Golmar doorbell auto release');
+                this.binaryState = false;
+                this.lastDoorbellResetTimer = undefined;
             }, 3000);
 
             return;
@@ -585,6 +657,57 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         }
 
         this.binaryState = false;
+    }
+
+    async handlePressedDoorbell(): Promise<void> {
+        const handledByPackageMode = await this.plugin.handlePackageModeDoorbell(this);
+
+        if (handledByPackageMode) {
+            this.console.log('Doorbell handled by package mode; skipping greeting');
+            return;
+        }
+
+        await this.handleDoorbellGreeting();
+    }
+
+    async handleDoorbellGreeting(): Promise<void> {
+        const mode = this.plugin.getDoorbellPresenceMode();
+
+        this.console.log(
+            `Doorbell greeting decision: mode=${mode}, alarmState=${this.plugin.getExternalAlarmState()}`
+        );
+
+        switch (mode) {
+            case 'home':
+                await this.playGreeting('home');
+                return;
+
+            case 'away':
+                await this.playGreeting('away');
+                return;
+
+            case 'night':
+                this.console.log('Night mode active: suppressing greeting');
+                return;
+
+            case 'alarm':
+                this.console.warn('Alarm triggered: suppressing greeting');
+                return;
+
+            case 'normal':
+            case 'unknown':
+            default:
+                this.console.log('No greeting for normal/unknown mode');
+                return;
+        }
+    }
+
+    async playGreeting(kind: 'home' | 'away'): Promise<void> {
+        this.console.log(`Greeting requested: ${kind}`);
+
+        // Later:
+        // POST ${this.getPiBaseUrl()}/greeting/home
+        // POST ${this.getPiBaseUrl()}/greeting/away
     }
 
     async sendPiWsCommand(command: any, expectedType: string): Promise<any> {
@@ -618,7 +741,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             } catch (e) {
                 this.pendingCommands = this.pendingCommands.filter(p => p !== pending);
                 clearTimeout(pending.timeout);
-                reject(e);
+                reject(e as Error);
             }
         });
     }
@@ -684,8 +807,8 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.console.log('Golmar doorbell pressed');
         this.binaryState = true;
 
-        void this.plugin.handlePackageModeDoorbell(this).catch(e => {
-            this.console.error(`Package mode simulated doorbell handling failed: ${e}`);
+        void this.handlePressedDoorbell().catch(e => {
+            this.console.error(`Simulated doorbell handling failed: ${e}`);
         });
 
         setTimeout(() => {
@@ -778,24 +901,38 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
     private packageModeExpiryTimer: any;
     private packageUnlockInFlight = false;
 
+    private haWs: any;
+    private haWsConnected = false;
+    private haReconnectTimer: any;
+    private haMessageId = 1;
+    private externalAlarmState: ExternalAlarmState = 'unknown';
+
     settingsStorage = new StorageSettings(this, {
-        email: {
-            title: 'Email',
-            onPut: async () => this.cleararTrySyncDevices(),
+        alarmStateSource: {
+            title: 'Alarm State Source',
+            type: 'string',
+            choices: [
+                'none',
+                'home_assistant',
+            ],
+            defaultValue: 'none',
+            description: 'Use a Home Assistant alarm_control_panel entity to determine home/away/night behavior.',
         },
-        password: {
-            title: 'Password',
+        haUrl: {
+            title: 'Home Assistant URL',
+            description: 'Example: http://homeassistant.local:8123',
+            defaultValue: 'http://homeassistant.local:8123',
+        },
+        haToken: {
+            title: 'Home Assistant Long-Lived Access Token',
             type: 'password',
-            onPut: async () => this.cleararTrySyncDevices(),
+            description: 'Create this in Home Assistant under your user profile.',
+            defaultValue: '',
         },
-        twoFactorCode: {
-            title: 'Two Factor Code',
-            description: 'Optional: If 2 factor is enabled on your account, enter the code sent to your email or phone number.',
-            onPut: async (oldValue, newValue) => {
-                await this.tryLogin(newValue);
-                await this.syncDevices(0);
-            },
-            noStore: true,
+        haAlarmEntityId: {
+            title: 'Home Assistant Alarm Entity ID',
+            description: 'Example: alarm_control_panel.alarmo',
+            defaultValue: 'alarm_control_panel.alarmo',
         },
     });
 
@@ -803,6 +940,8 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
         super();
         this.syncDevices(0);
         this.schedulePackageModeExpiryFromStorage();
+
+        setTimeout(() => this.connectHomeAssistantWebSocket(), 1500);
     }
 
     async getCreateDeviceSettings(): Promise<Setting[]> {
@@ -810,7 +949,7 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             {
                 key: 'name',
                 title: 'Name',
-            }
+            },
         ];
     }
 
@@ -846,8 +985,265 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
         return this.settingsStorage.getSettings();
     }
 
-    putSetting(key: string, value: SettingValue): Promise<void> {
-        return this.settingsStorage.putSetting(key, value);
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        await this.settingsStorage.putSetting(key, value);
+
+        if (
+            key === 'alarmStateSource' ||
+            key === 'haUrl' ||
+            key === 'haToken' ||
+            key === 'haAlarmEntityId'
+        ) {
+            this.reconnectHomeAssistantWebSocket();
+        }
+    }
+
+    getAlarmStateSource(): string {
+        return String(this.settingsStorage.values.alarmStateSource || 'none');
+    }
+
+    getHomeAssistantUrl(): string {
+        return String(this.settingsStorage.values.haUrl || '').replace(/\/$/, '');
+    }
+
+    getHomeAssistantWsUrl(): string {
+        const haUrl = this.getHomeAssistantUrl();
+
+        if (haUrl.startsWith('https://')) {
+            return haUrl.replace(/^https:\/\//, 'wss://') + '/api/websocket';
+        }
+
+        if (haUrl.startsWith('http://')) {
+            return haUrl.replace(/^http:\/\//, 'ws://') + '/api/websocket';
+        }
+
+        return haUrl;
+    }
+
+    getHomeAssistantToken(): string {
+        return String(this.settingsStorage.values.haToken || '').trim();
+    }
+
+    getHomeAssistantAlarmEntityId(): string {
+        return String(this.settingsStorage.values.haAlarmEntityId || 'alarm_control_panel.alarmo').trim();
+    }
+
+    setExternalAlarmState(rawState: any, reason: string) {
+        const next = normalizeAlarmState(rawState);
+
+        if (next === this.externalAlarmState) {
+            return;
+        }
+
+        const previous = this.externalAlarmState;
+        this.externalAlarmState = next;
+
+        this.console.log(
+            `External alarm state changed by ${reason}: ${previous} -> ${next} ` +
+            `(doorbellMode=${this.getDoorbellPresenceMode()})`
+        );
+    }
+
+    getExternalAlarmState(): ExternalAlarmState {
+        return this.externalAlarmState;
+    }
+
+    getDoorbellPresenceMode(): DoorbellPresenceMode {
+        return alarmStateToDoorbellPresenceMode(this.externalAlarmState);
+    }
+
+    connectHomeAssistantWebSocket() {
+        if (this.getAlarmStateSource() !== 'home_assistant') {
+            this.console.log('Home Assistant alarm state source disabled');
+            this.setExternalAlarmState('unknown', 'ha-disabled');
+            return;
+        }
+
+        const token = this.getHomeAssistantToken();
+        const entityId = this.getHomeAssistantAlarmEntityId();
+        const wsUrl = this.getHomeAssistantWsUrl();
+
+        if (!token || !entityId || !wsUrl) {
+            this.console.warn('Home Assistant alarm state source is enabled but URL, token or entity ID is missing');
+            this.setExternalAlarmState('unknown', 'ha-config-missing');
+            return;
+        }
+
+        if (this.haWs && this.haWsConnected) {
+            return;
+        }
+
+        const WebSocketImpl = (globalThis as any).WebSocket;
+
+        if (!WebSocketImpl) {
+            this.console.error('No global WebSocket implementation available in this Scrypted runtime.');
+            this.setExternalAlarmState('unknown', 'ha-no-websocket');
+            return;
+        }
+
+        this.console.log(`Connecting to Home Assistant WebSocket: ${wsUrl}`);
+
+        try {
+            this.haWs = new WebSocketImpl(wsUrl);
+        } catch (e) {
+            this.console.error(`Failed to create Home Assistant WebSocket: ${e}`);
+            this.scheduleHomeAssistantReconnect();
+            return;
+        }
+
+        this.haWs.onopen = () => {
+            this.console.log('Home Assistant WebSocket opened');
+        };
+
+        this.haWs.onmessage = (event: any) => {
+            this.handleHomeAssistantMessage(event.data);
+        };
+
+        this.haWs.onerror = (event: any) => {
+            this.console.error(`Home Assistant WebSocket error: ${JSON.stringify(event)}`);
+        };
+
+        this.haWs.onclose = () => {
+            this.console.warn('Home Assistant WebSocket closed');
+            this.haWsConnected = false;
+            this.haWs = undefined;
+
+            if (this.getAlarmStateSource() === 'home_assistant') {
+                this.scheduleHomeAssistantReconnect();
+            }
+        };
+    }
+
+    handleHomeAssistantMessage(raw: any) {
+        const text = typeof raw === 'string' ? raw : raw?.toString?.() || '';
+
+        let message: any;
+
+        try {
+            message = JSON.parse(text);
+        } catch (e) {
+            this.console.warn(`Invalid Home Assistant WS JSON: ${text}`);
+            return;
+        }
+
+        if (message.type === 'auth_required') {
+            this.haWs?.send(JSON.stringify({
+                type: 'auth',
+                access_token: this.getHomeAssistantToken(),
+            }));
+            return;
+        }
+
+        if (message.type === 'auth_invalid') {
+            this.console.error(`Home Assistant authentication failed: ${message.message || 'auth_invalid'}`);
+            this.setExternalAlarmState('unknown', 'ha-auth-invalid');
+
+            try {
+                this.haWs?.close();
+            } catch (e) {
+                // ignore
+            }
+
+            return;
+        }
+
+        if (message.type === 'auth_ok') {
+            this.haWsConnected = true;
+            this.console.log(`Home Assistant authenticated, version=${message.ha_version || 'unknown'}`);
+
+            this.haSend({
+                type: 'get_states',
+            });
+
+            this.haSend({
+                type: 'subscribe_events',
+                event_type: 'state_changed',
+            });
+
+            return;
+        }
+
+        if (message.type === 'result' && Array.isArray(message.result)) {
+            const entityId = this.getHomeAssistantAlarmEntityId();
+            const state = message.result.find((s: any) => s.entity_id === entityId);
+
+            if (!state) {
+                this.console.warn(`Home Assistant alarm entity not found: ${entityId}`);
+                this.setExternalAlarmState('unknown', 'ha-entity-not-found');
+                return;
+            }
+
+            this.setExternalAlarmState(state.state, 'ha-get-states');
+            return;
+        }
+
+        if (message.type === 'event') {
+            const data = message.event?.data;
+            const entityId = this.getHomeAssistantAlarmEntityId();
+
+            if (data?.entity_id !== entityId) {
+                return;
+            }
+
+            const newState = data?.new_state?.state;
+            this.setExternalAlarmState(newState, 'ha-state-changed');
+            return;
+        }
+
+        if (message.type === 'pong') {
+            return;
+        }
+    }
+
+    haSend(payload: any) {
+        if (!this.haWs || !this.haWsConnected) {
+            this.console.warn(`Cannot send Home Assistant WS command while disconnected: ${JSON.stringify(payload)}`);
+            return;
+        }
+
+        const message = {
+            id: this.haMessageId++,
+            ...payload,
+        };
+
+        this.haWs.send(JSON.stringify(message));
+    }
+
+    scheduleHomeAssistantReconnect() {
+        if (this.haReconnectTimer) {
+            return;
+        }
+
+        this.haReconnectTimer = setTimeout(() => {
+            this.haReconnectTimer = undefined;
+            this.connectHomeAssistantWebSocket();
+        }, 10000);
+    }
+
+    reconnectHomeAssistantWebSocket() {
+        this.console.log('Reconnecting Home Assistant WebSocket');
+
+        if (this.haReconnectTimer) {
+            clearTimeout(this.haReconnectTimer);
+            this.haReconnectTimer = undefined;
+        }
+
+        if (this.haWs) {
+            try {
+                this.haWs.close();
+            } catch (e) {
+                // ignore
+            }
+
+            this.haWs = undefined;
+            this.haWsConnected = false;
+        }
+
+        if (this.getAlarmStateSource() === 'home_assistant') {
+            setTimeout(() => this.connectHomeAssistantWebSocket(), 500);
+        } else {
+            this.setExternalAlarmState('unknown', 'ha-disabled');
+        }
     }
 
     async syncDevices(duration: number) {
@@ -882,7 +1278,7 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
                     model: 'Door Opener',
                     manufacturer: 'Golmar',
                 },
-                nativeId: 'golmar-lock',
+                nativeId: GOLMAR_LOCK_NATIVE_ID,
                 name: 'Golmar Door Lock',
                 type: ScryptedDeviceType.Lock,
                 interfaces: lockInterfaces,
@@ -914,14 +1310,11 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
 
             if (nativeId === GOLMAR_INTERCOM_NATIVE_ID) {
                 device = new GolmarCameraDevice(this, nativeId);
-            }
-            else if (nativeId === 'golmar-lock') {
+            } else if (nativeId === GOLMAR_LOCK_NATIVE_ID) {
                 device = new GolmarLockDevice(this, nativeId);
-            }
-            else if (nativeId === PACKAGE_MODE_NATIVE_ID) {
+            } else if (nativeId === PACKAGE_MODE_NATIVE_ID) {
                 device = new GolmarPackageModeSwitch(this, nativeId);
-            }
-            else {
+            } else {
                 throw new Error(`Unknown nativeId: ${nativeId}`);
             }
 
@@ -992,19 +1385,18 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             this.storage.setItem('packageModeExpiresAt', expiresAt.toString());
 
             this.console.log(
-            `Package mode enabled by ${reason}, expiresAt=${new Date(expiresAt).toISOString()}`
+                `Package mode enabled by ${reason}, expiresAt=${new Date(expiresAt).toISOString()}`
             );
 
             this.schedulePackageModeExpiry(expiresAt);
-        }
-        else {
+        } else {
             this.storage.setItem('packageMode', 'false');
             this.storage.setItem('packageModeUsed', 'false');
             this.storage.setItem('packageModeExpiresAt', '0');
 
             if (this.packageModeExpiryTimer) {
-            clearTimeout(this.packageModeExpiryTimer);
-            this.packageModeExpiryTimer = undefined;
+                clearTimeout(this.packageModeExpiryTimer);
+                this.packageModeExpiryTimer = undefined;
             }
 
             this.console.log(`Package mode disabled by ${reason}`);
@@ -1039,51 +1431,42 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             this.console.log('Package mode automatically expired after 8 hours');
 
             void this.setPackageMode(false, 'expiry-timer').catch(e => {
-            this.console.error(`Failed to disable expired package mode: ${e}`);
+                this.console.error(`Failed to disable expired package mode: ${e}`);
             });
         }, delay);
     }
 
-    async handlePackageModeDoorbell(camera: GolmarCameraDevice): Promise<void> {
+    async handlePackageModeDoorbell(camera: GolmarCameraDevice): Promise<boolean> {
         if (this.packageUnlockInFlight) {
             this.console.warn('Package mode ignored: package unlock already in flight');
-            return;
+            return true;
         }
 
         if (!this.isPackageModeEnabled()) {
-            return;
+            return false;
         }
 
         if (this.isPackageModeUsed()) {
             this.console.warn('Package mode ignored: already used');
-            return;
+            return true;
         }
 
         this.packageUnlockInFlight = true;
-
-        // Consumeer pakketmodus vóór de HTTP-call.
-        // Dit voorkomt dubbele opens als er meerdere doorbell-events of timeouts zijn.
         this.storage.setItem('packageModeUsed', 'true');
 
         try {
             this.console.log('Package mode doorbell accepted: calling /package-unlock');
-
             await camera.packageUnlockDoor();
-
             this.console.log('Package mode unlock completed; disabling package mode');
-
             await this.setPackageMode(false, 'used');
-        }
-        catch (e) {
+        } catch (e) {
             this.console.error(`Package mode unlock failed or was rejected: ${e}`);
-
-            // Veiligheidskeuze: ook bij fout package mode uitzetten.
-            // Als de Pi wel opende maar de response faalde, voorkom je een tweede poging.
             await this.setPackageMode(false, 'package-unlock-error');
-        }
-        finally {
+        } finally {
             this.packageUnlockInFlight = false;
         }
+
+        return true;
     }
 }
 

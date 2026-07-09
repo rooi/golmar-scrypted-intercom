@@ -75,6 +75,12 @@ def health():
             "cooldown_seconds": GREETING_COOLDOWN_SECONDS,
             "last_greeting_time": last_greeting_time or None,
         },
+        "away_followup": {
+            "enabled": AWAY_FOLLOWUP_ENABLED,
+            "file": AWAY_FOLLOWUP_FILE,
+            "file_exists": os.path.isfile(AWAY_FOLLOWUP_FILE),
+            "delay_seconds": AWAY_FOLLOWUP_DELAY_SECONDS,
+        },
         "time": time.time(),
     })
 
@@ -163,6 +169,8 @@ def unlock_door():
     zodat een ontbrekend/kapot audiobestand de unlock-call niet vertraagt
     of vast laat lopen.
     """
+    cancel_away_followup("door unlocked")
+
     with unlock_lock:
         print("Activating Automation HAT output one", flush=True)
         subprocess.run([
@@ -211,9 +219,19 @@ UNLOCK_SOUND_TIMEOUT_SECONDS = 8
 # Kort houden, zodat je snel zelf kunt overnemen.
 GREETING_SOUND_ENABLED = True
 GREETING_SOUND_FILE = str(BASE_DIR / "audio" / "greeting_home.wav")
-GREETING_SOUND_VOLUME = "4.0"
-GREETING_SOUND_TIMEOUT_SECONDS = 7
+GREETING_SOUND_VOLUME = "5.0"
+GREETING_SOUND_TIMEOUT_SECONDS = 12
 
+# Bericht wanneer ik away ben en niet tijdig reageer.
+AWAY_FOLLOWUP_ENABLED = True
+AWAY_FOLLOWUP_FILE = str(BASE_DIR / "audio" / "away_no_response.wav")
+AWAY_FOLLOWUP_DELAY_SECONDS = 30
+AWAY_FOLLOWUP_VOLUME = "5.0"
+AWAY_FOLLOWUP_TIMEOUT_SECONDS = 12
+
+away_followup_timer = None
+away_followup_lock = threading.Lock()
+away_followup_generation = 0
 # Voorkomt meerdere greetings door bounce / lang indrukken / status-flaps.
 GREETING_COOLDOWN_SECONDS = 20
 last_greeting_time = 0.0
@@ -308,30 +326,192 @@ def stop_greeting_sound(reason="unknown"):
         if stopped:
             print(f"Greeting stopped: {reason}", flush=True)
 
-def play_greeting_sound():
-    """
-    Speel de deurbel-greeting af.
+def cancel_away_followup(reason="unknown"):
+    """Annuleer het away-vervolgbericht, bijvoorbeeld zodra talkback of unlock start."""
+    global away_followup_timer, away_followup_generation
 
-    Veiligheidskeuzes:
-    - ontbrekend bestand: skip
-    - talkback al actief: skip
-    - als talkback start tijdens greeting: speaker_raw stopt deze greeting
-    - cooldown tegen dubbele triggers
-    - timeout tegen hangende ffmpeg/aplay
-    """
+    with away_followup_lock:
+        away_followup_generation += 1
+
+        if away_followup_timer:
+            try:
+                away_followup_timer.cancel()
+                print(f"Away follow-up cancelled: {reason}", flush=True)
+            except Exception as e:
+                print(f"Away follow-up cancel failed: {e}", flush=True)
+
+        away_followup_timer = None
+
+
+def schedule_away_followup():
+    """Plan een vervolgbericht als er na de away greeting geen reactie komt."""
+    global away_followup_timer, away_followup_generation
+
+    if not AWAY_FOLLOWUP_ENABLED:
+        return
+
+    if not AWAY_FOLLOWUP_FILE or not os.path.isfile(AWAY_FOLLOWUP_FILE):
+        print(f"Away follow-up skipped: file not found: {AWAY_FOLLOWUP_FILE}", flush=True)
+        return
+
+    with away_followup_lock:
+        away_followup_generation += 1
+        generation = away_followup_generation
+
+        if away_followup_timer:
+            away_followup_timer.cancel()
+
+        print(
+            f"Away follow-up scheduled in {AWAY_FOLLOWUP_DELAY_SECONDS}s",
+            flush=True,
+        )
+
+        away_followup_timer = threading.Timer(
+            AWAY_FOLLOWUP_DELAY_SECONDS,
+            play_away_followup_if_no_response,
+            args=(generation,),
+        )
+        away_followup_timer.daemon = True
+        away_followup_timer.start()
+
+
+def play_away_followup_if_no_response(generation):
+    """Speel het vervolgbericht alleen als er nog geen talkback/reactie is geweest."""
+    global away_followup_timer
+
+    with away_followup_lock:
+        if generation != away_followup_generation:
+            print("Away follow-up skipped: stale generation", flush=True)
+            return
+        away_followup_timer = None
+
+    with speaker_stream_lock:
+        if speaker_stream_active:
+            print("Away follow-up skipped: speaker/talkback stream active", flush=True)
+            return
+
+    play_audio_file(
+        AWAY_FOLLOWUP_FILE,
+        AWAY_FOLLOWUP_VOLUME,
+        AWAY_FOLLOWUP_TIMEOUT_SECONDS,
+        "Away follow-up",
+    )
+
+def play_audio_file(file_path, volume, timeout_seconds, label):
+    """Speel een audiobestand naar de Golmar speaker via ffmpeg -> aplay."""
+    if not file_path or not os.path.isfile(file_path):
+        print(f"{label} skipped: file not found: {file_path}", flush=True)
+        return
+
+    with speaker_stream_lock:
+        if speaker_stream_active:
+            print(f"{label} skipped: speaker/talkback stream active", flush=True)
+            return
+
+    ffmpeg = None
+    aplay = None
+    relay_acquired = False
+
+    try:
+        print(f"Playing {label}: {file_path}", flush=True)
+
+        audio_relay_acquire()
+        relay_acquired = True
+
+        ffmpeg = subprocess.Popen([
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-nostdin",
+            "-i", file_path,
+            "-vn",
+            "-af", f"volume={volume}",
+            "-acodec", "pcm_s16le",
+            "-ac", SPEAKER_CHANNELS,
+            "-ar", SPEAKER_RATE,
+            "-f", "s16le",
+            "pipe:1",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        aplay = subprocess.Popen([
+            "aplay",
+            "-D", SPEAKER_DEVICE,
+            "-f", "S16_LE",
+            "-r", SPEAKER_RATE,
+            "-c", SPEAKER_CHANNELS,
+        ], stdin=ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        if ffmpeg.stdout:
+            ffmpeg.stdout.close()
+
+        _, aplay_err = aplay.communicate(timeout=timeout_seconds)
+
+        try:
+            ffmpeg_err = ffmpeg.stderr.read(4096) if ffmpeg.stderr else b""
+        except Exception:
+            ffmpeg_err = b""
+
+        try:
+            ffmpeg.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            ffmpeg.kill()
+
+        if ffmpeg.returncode not in (0, None):
+            print(f"{label} ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
+
+        if aplay.returncode != 0:
+            print(f"{label} aplay error:", aplay_err.decode(errors="replace"), flush=True)
+
+        print(f"{label} finished", flush=True)
+
+    except subprocess.TimeoutExpired:
+        print(f"{label} timeout; killing playback", flush=True)
+        try:
+            if aplay:
+                aplay.kill()
+        except Exception:
+            pass
+        try:
+            if ffmpeg:
+                ffmpeg.kill()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"{label} failed:", repr(e), flush=True)
+
+    finally:
+        if relay_acquired:
+            try:
+                audio_relay_release()
+            except Exception as e:
+                print(f"{label} relay release failed:", e, flush=True)
+
+def play_greeting_sound():
     global last_greeting_time, greeting_ffmpeg, greeting_aplay
 
     if not GREETING_SOUND_ENABLED:
         return
 
     now = time.time()
+
     if now - last_greeting_time < GREETING_COOLDOWN_SECONDS:
         remaining = int(GREETING_COOLDOWN_SECONDS - (now - last_greeting_time))
         print(f"Greeting skipped: cooldown active, remaining={remaining}s", flush=True)
         return
 
-    if not GREETING_SOUND_FILE or not os.path.isfile(GREETING_SOUND_FILE):
-        print(f"Greeting skipped: file not found: {GREETING_SOUND_FILE}", flush=True)
+    # Pas dit aan aan jouw eigen home/away-koppeling.
+    # Voorbeeld:
+    is_away = get_current_presence_mode() == "away"
+
+    greeting_file = (
+        str(BASE_DIR / "audio" / "greeting_away.wav")
+        if is_away
+        else str(BASE_DIR / "audio" / "greeting_home.wav")
+    )
+
+    if not greeting_file or not os.path.isfile(greeting_file):
+        print(f"Greeting skipped: file not found: {greeting_file}", flush=True)
         return
 
     with speaker_stream_lock:
@@ -339,93 +519,26 @@ def play_greeting_sound():
             print("Greeting skipped: speaker/talkback stream active", flush=True)
             return
 
-    relay_acquired = False
-
     with greeting_lock:
-        # Als er nog een oude greeting draait: niet stapelen.
         if greeting_aplay and greeting_aplay.poll() is None:
             print("Greeting skipped: previous greeting still playing", flush=True)
             return
 
         try:
-            print(f"Playing greeting sound: {GREETING_SOUND_FILE}", flush=True)
             last_greeting_time = now
 
-            audio_relay_acquire()
-            relay_acquired = True
+            play_audio_file(
+                greeting_file,
+                GREETING_SOUND_VOLUME,
+                GREETING_SOUND_TIMEOUT_SECONDS,
+                "Greeting",
+            )
 
-            greeting_ffmpeg = subprocess.Popen([
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "warning",
-                "-nostdin",
-                "-i", GREETING_SOUND_FILE,
-                "-vn",
-                "-af", f"volume={GREETING_SOUND_VOLUME}",
-                "-acodec", "pcm_s16le",
-                "-ac", SPEAKER_CHANNELS,
-                "-ar", SPEAKER_RATE,
-                "-f", "s16le",
-                "pipe:1",
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            greeting_aplay = subprocess.Popen([
-                "aplay",
-                "-D", SPEAKER_DEVICE,
-                "-f", "S16_LE",
-                "-r", SPEAKER_RATE,
-                "-c", SPEAKER_CHANNELS,
-            ], stdin=greeting_ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-            if greeting_ffmpeg.stdout:
-                greeting_ffmpeg.stdout.close()
-
-            _, aplay_err = greeting_aplay.communicate(timeout=GREETING_SOUND_TIMEOUT_SECONDS)
-
-            try:
-                ffmpeg_err = greeting_ffmpeg.stderr.read(4096) if greeting_ffmpeg.stderr else b""
-            except Exception:
-                ffmpeg_err = b""
-
-            try:
-                greeting_ffmpeg.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                greeting_ffmpeg.kill()
-
-            if greeting_ffmpeg.returncode not in (0, None):
-                print("Greeting ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
-
-            if greeting_aplay.returncode != 0:
-                print("Greeting aplay error:", aplay_err.decode(errors="replace"), flush=True)
-
-            print("Greeting sound finished", flush=True)
-
-        except subprocess.TimeoutExpired:
-            print("Greeting timeout; killing playback", flush=True)
-            try:
-                if greeting_aplay:
-                    greeting_aplay.kill()
-            except Exception:
-                pass
-            try:
-                if greeting_ffmpeg:
-                    greeting_ffmpeg.kill()
-            except Exception:
-                pass
+            if is_away:
+                schedule_away_followup()
 
         except Exception as e:
             print("Greeting failed:", repr(e), flush=True)
-
-        finally:
-            greeting_ffmpeg = None
-            greeting_aplay = None
-
-            if relay_acquired:
-                try:
-                    audio_relay_release()
-                except Exception as e:
-                    print("Greeting relay release failed:", e, flush=True)
-
 
 def play_unlock_sound():
     """
@@ -541,6 +654,7 @@ def speaker_raw():
     # Als jij via HomeKit/Safari begint te praten terwijl de greeting loopt,
     # breken we de greeting direct af zodat talkback voorrang heeft.
     stop_greeting_sound("speaker/talkback stream started")
+    cancel_away_followup("speaker/talkback stream started")
 
     total_bytes = 0
     chunks = 0

@@ -68,6 +68,13 @@ def health():
             "remaining_seconds": package_unlock_remaining_seconds,
             "cooldown_active": package_unlock_remaining_seconds > 0,
         },
+        "greeting": {
+            "enabled": GREETING_SOUND_ENABLED,
+            "file": GREETING_SOUND_FILE,
+            "file_exists": os.path.isfile(GREETING_SOUND_FILE),
+            "cooldown_seconds": GREETING_COOLDOWN_SECONDS,
+            "last_greeting_time": last_greeting_time or None,
+        },
         "time": time.time(),
     })
 
@@ -164,7 +171,7 @@ def unlock_door():
             (
                 "import automationhat, time; "
                 "automationhat.output.one.on(); "
-                "time.sleep(1); "
+                "time.sleep(2); "
                 "automationhat.output.one.off()"
             )
         ], check=True, timeout=3)
@@ -199,6 +206,22 @@ UNLOCK_SOUND_ENABLED = True
 UNLOCK_SOUND_FILE = str(BASE_DIR / "audio" / "unlock.wav")
 UNLOCK_SOUND_VOLUME = "5.0"
 UNLOCK_SOUND_TIMEOUT_SECONDS = 8
+
+# Audiobestand dat automatisch bij aanbellen afgespeeld wordt.
+# Kort houden, zodat je snel zelf kunt overnemen.
+GREETING_SOUND_ENABLED = True
+GREETING_SOUND_FILE = str(BASE_DIR / "audio" / "greeting_home.wav")
+GREETING_SOUND_VOLUME = "4.0"
+GREETING_SOUND_TIMEOUT_SECONDS = 7
+
+# Voorkomt meerdere greetings door bounce / lang indrukken / status-flaps.
+GREETING_COOLDOWN_SECONDS = 20
+last_greeting_time = 0.0
+
+# Huidige greeting-processen, zodat talkback de greeting kan afbreken.
+greeting_lock = threading.Lock()
+greeting_ffmpeg = None
+greeting_aplay = None
 
 audio_relay_lock = threading.Lock()
 audio_relay_users = 0
@@ -259,6 +282,150 @@ def audio_relay_release():
                 set_audio_relay(False)
             except Exception as e:
                 print("Audio relay off failed:", e, flush=True)
+
+def stop_greeting_sound(reason="unknown"):
+    """
+    Stop de greeting direct, bijvoorbeeld wanneer HomeKit/Safari talkback start.
+    Veilig: killt alleen de greeting-processen, niet de speaker_raw talkback-stream.
+    """
+    global greeting_ffmpeg, greeting_aplay
+
+    with greeting_lock:
+        stopped = False
+
+        for proc_name, proc in (("aplay", greeting_aplay), ("ffmpeg", greeting_ffmpeg)):
+            if proc and proc.poll() is None:
+                try:
+                    print(f"Stopping greeting {proc_name}: {reason}", flush=True)
+                    proc.kill()
+                    stopped = True
+                except Exception as e:
+                    print(f"Failed to stop greeting {proc_name}: {e}", flush=True)
+
+        greeting_ffmpeg = None
+        greeting_aplay = None
+
+        if stopped:
+            print(f"Greeting stopped: {reason}", flush=True)
+
+def play_greeting_sound():
+    """
+    Speel de deurbel-greeting af.
+
+    Veiligheidskeuzes:
+    - ontbrekend bestand: skip
+    - talkback al actief: skip
+    - als talkback start tijdens greeting: speaker_raw stopt deze greeting
+    - cooldown tegen dubbele triggers
+    - timeout tegen hangende ffmpeg/aplay
+    """
+    global last_greeting_time, greeting_ffmpeg, greeting_aplay
+
+    if not GREETING_SOUND_ENABLED:
+        return
+
+    now = time.time()
+    if now - last_greeting_time < GREETING_COOLDOWN_SECONDS:
+        remaining = int(GREETING_COOLDOWN_SECONDS - (now - last_greeting_time))
+        print(f"Greeting skipped: cooldown active, remaining={remaining}s", flush=True)
+        return
+
+    if not GREETING_SOUND_FILE or not os.path.isfile(GREETING_SOUND_FILE):
+        print(f"Greeting skipped: file not found: {GREETING_SOUND_FILE}", flush=True)
+        return
+
+    with speaker_stream_lock:
+        if speaker_stream_active:
+            print("Greeting skipped: speaker/talkback stream active", flush=True)
+            return
+
+    relay_acquired = False
+
+    with greeting_lock:
+        # Als er nog een oude greeting draait: niet stapelen.
+        if greeting_aplay and greeting_aplay.poll() is None:
+            print("Greeting skipped: previous greeting still playing", flush=True)
+            return
+
+        try:
+            print(f"Playing greeting sound: {GREETING_SOUND_FILE}", flush=True)
+            last_greeting_time = now
+
+            audio_relay_acquire()
+            relay_acquired = True
+
+            greeting_ffmpeg = subprocess.Popen([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-nostdin",
+                "-i", GREETING_SOUND_FILE,
+                "-vn",
+                "-af", f"volume={GREETING_SOUND_VOLUME}",
+                "-acodec", "pcm_s16le",
+                "-ac", SPEAKER_CHANNELS,
+                "-ar", SPEAKER_RATE,
+                "-f", "s16le",
+                "pipe:1",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            greeting_aplay = subprocess.Popen([
+                "aplay",
+                "-D", SPEAKER_DEVICE,
+                "-f", "S16_LE",
+                "-r", SPEAKER_RATE,
+                "-c", SPEAKER_CHANNELS,
+            ], stdin=greeting_ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            if greeting_ffmpeg.stdout:
+                greeting_ffmpeg.stdout.close()
+
+            _, aplay_err = greeting_aplay.communicate(timeout=GREETING_SOUND_TIMEOUT_SECONDS)
+
+            try:
+                ffmpeg_err = greeting_ffmpeg.stderr.read(4096) if greeting_ffmpeg.stderr else b""
+            except Exception:
+                ffmpeg_err = b""
+
+            try:
+                greeting_ffmpeg.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                greeting_ffmpeg.kill()
+
+            if greeting_ffmpeg.returncode not in (0, None):
+                print("Greeting ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
+
+            if greeting_aplay.returncode != 0:
+                print("Greeting aplay error:", aplay_err.decode(errors="replace"), flush=True)
+
+            print("Greeting sound finished", flush=True)
+
+        except subprocess.TimeoutExpired:
+            print("Greeting timeout; killing playback", flush=True)
+            try:
+                if greeting_aplay:
+                    greeting_aplay.kill()
+            except Exception:
+                pass
+            try:
+                if greeting_ffmpeg:
+                    greeting_ffmpeg.kill()
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("Greeting failed:", repr(e), flush=True)
+
+        finally:
+            greeting_ffmpeg = None
+            greeting_aplay = None
+
+            if relay_acquired:
+                try:
+                    audio_relay_release()
+                except Exception as e:
+                    print("Greeting relay release failed:", e, flush=True)
+
 
 def play_unlock_sound():
     """
@@ -366,11 +533,14 @@ def play_unlock_sound():
 @app.route("/speaker/raw", methods=["POST", "PUT"])
 def speaker_raw():
     global speaker_stream_active
-
     print("Speaker raw stream started", flush=True)
 
     with speaker_stream_lock:
         speaker_stream_active = True
+
+    # Als jij via HomeKit/Safari begint te praten terwijl de greeting loopt,
+    # breken we de greeting direct af zodat talkback voorrang heeft.
+    stop_greeting_sound("speaker/talkback stream started")
 
     total_bytes = 0
     chunks = 0
@@ -1153,7 +1323,6 @@ async def handle_ws(websocket):
         clients.discard(websocket)
         print("WebSocket client disconnected", flush=True)
 
-
 def read_doorbell_loop(loop):
     """
     Lees de analoge belspanning op Automation HAT analog one.
@@ -1186,7 +1355,6 @@ def read_doorbell_loop(loop):
 
             if pressed != last_pressed:
                 last_pressed = pressed
-
                 event = {
                     "type": "doorbell",
                     "pressed": pressed,
@@ -1194,16 +1362,19 @@ def read_doorbell_loop(loop):
                     "threshold": doorbell_threshold,
                     "time": time.time(),
                 }
-
                 print(event, flush=True)
                 last_doorbell_event = event
                 asyncio.run_coroutine_threadsafe(broadcast(event), loop)
+
+                # Alleen bij daadwerkelijke beldruk starten, niet bij release.
+                # In aparte thread, zodat de analoge monitor en websocket events blijven lopen.
+                if pressed:
+                    threading.Thread(target=play_greeting_sound, daemon=True).start()
 
         except Exception as e:
             print("Doorbell monitor error:", e, flush=True)
 
         time.sleep(0.05)
-
 
 def run_http():
     print(f"HTTP listening on {HTTP_PORT}", flush=True)

@@ -591,9 +591,6 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
                 'pong'
             );
 
-            this.console.log(
-                `Pi WebSocket watchdog OK: ${JSON.stringify(response)}`
-            );
         } catch (e) {
             this.console.error(`Pi WebSocket watchdog failed: ${e}`);
             this.forcePiWsReconnect('watchdog ping failed');
@@ -752,9 +749,11 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     handlePiWsMessage(raw: any) {
-        const text = typeof raw === 'string' ? raw : raw?.toString?.() || '';
-
-        this.console.log(`Pi WS RX: ${text}`);
+        const text = typeof raw === 'string'
+            ? raw
+            : raw && raw.toString
+                ? raw.toString()
+                : '';
 
         let event: any;
 
@@ -765,6 +764,11 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             return;
         }
 
+        // Watchdog-pongs niet loggen.
+        if (event.type !== 'pong') {
+            this.console.log(`Pi WS RX: ${text}`);
+        }
+
         this.resolvePendingWsCommand(event);
 
         if (event.type === 'hello') {
@@ -772,13 +776,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             return;
         }
 
-        if (event.type === 'doorbell') {
-            this.handleDoorbellEvent(event);
-            return;
-        }
-
-        if (event.type === 'bell') {
-            // Compatibiliteit, mocht de Pi-agent later 'bell' sturen.
+        if (event.type === 'doorbell' || event.type === 'bell') {
             this.handleDoorbellEvent(event);
             return;
         }
@@ -847,7 +845,9 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         const message = JSON.stringify(command);
 
-        this.console.log(`Pi WS TX: ${message}`);
+        if (command?.type !== 'ping') {
+            this.console.log(`Pi WS TX: ${message}`);
+        }
 
         return new Promise((resolve, reject) => {
             const pending: PendingWsCommand = {

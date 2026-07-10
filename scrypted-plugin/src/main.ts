@@ -67,6 +67,12 @@ type DoorbellPresenceMode =
     | 'alarm'
     | 'unknown';
 
+type IntercomMode =
+    | 'home'
+    | 'away'
+    | 'night'
+    | 'disarmed';
+
 function normalizeAlarmState(raw: any): ExternalAlarmState {
     const value = String(raw || '').trim().toLowerCase();
 
@@ -363,6 +369,31 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.intercomProcess = undefined;
     }
 
+    async setIntercomMode(mode: IntercomMode): Promise<void> {
+        const url = `${this.getPiBaseUrl()}/intercom-mode`;
+
+        this.console.log(`Setting Pi intercom mode to ${mode}: ${url}`);
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ mode }),
+        });
+
+        const body = await response.text();
+
+        if (!response.ok) {
+            throw new Error(
+                `Setting intercom mode failed: ` +
+                `${response.status} ${response.statusText}: ${body}`
+            );
+        }
+
+        this.console.log(`Pi intercom mode set: ${body}`);
+    }
+
     async getSettings(): Promise<Setting[]> {
         const settings = await this.settingsStorage.getSettings();
 
@@ -535,6 +566,12 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.piWs.onopen = () => {
             this.piWsConnected = true;
             this.console.log(`Pi WebSocket connected: ${url}`);
+
+            void this.plugin.syncIntercomModeToAgent().catch(e => {
+                this.console.error(
+                    `Failed to synchronize intercom mode after Pi connection: ${e}`
+                );
+            });
         };
 
         this.piWs.onmessage = (event: any) => {
@@ -660,54 +697,19 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async handlePressedDoorbell(): Promise<void> {
-        const handledByPackageMode = await this.plugin.handlePackageModeDoorbell(this);
+        const handledByPackageMode =
+            await this.plugin.handlePackageModeDoorbell(this);
 
         if (handledByPackageMode) {
-            this.console.log('Doorbell handled by package mode; skipping greeting');
+            this.console.log(
+                'Doorbell handled by package mode; greeting handled by Pi agent'
+            );
             return;
         }
 
-        await this.handleDoorbellGreeting();
-    }
-
-    async handleDoorbellGreeting(): Promise<void> {
-        const mode = this.plugin.getDoorbellPresenceMode();
-
         this.console.log(
-            `Doorbell greeting decision: mode=${mode}, alarmState=${this.plugin.getExternalAlarmState()}`
+            `Doorbell received; Pi agent handles greeting using mode=${this.plugin.getDoorbellPresenceMode()}`
         );
-
-        switch (mode) {
-            case 'home':
-                await this.playGreeting('home');
-                return;
-
-            case 'away':
-                await this.playGreeting('away');
-                return;
-
-            case 'night':
-                this.console.log('Night mode active: suppressing greeting');
-                return;
-
-            case 'alarm':
-                this.console.warn('Alarm triggered: suppressing greeting');
-                return;
-
-            case 'normal':
-            case 'unknown':
-            default:
-                this.console.log('No greeting for normal/unknown mode');
-                return;
-        }
-    }
-
-    async playGreeting(kind: 'home' | 'away'): Promise<void> {
-        this.console.log(`Greeting requested: ${kind}`);
-
-        // Later:
-        // POST ${this.getPiBaseUrl()}/greeting/home
-        // POST ${this.getPiBaseUrl()}/greeting/away
     }
 
     async sendPiWsCommand(command: any, expectedType: string): Promise<any> {
@@ -1032,6 +1034,11 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
         const next = normalizeAlarmState(rawState);
 
         if (next === this.externalAlarmState) {
+            this.console.log(
+                `External alarm state confirmed by ${reason}: ${next}`
+            );
+
+            void this.syncIntercomModeToAgent();
             return;
         }
 
@@ -1042,6 +1049,8 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             `External alarm state changed by ${reason}: ${previous} -> ${next} ` +
             `(doorbellMode=${this.getDoorbellPresenceMode()})`
         );
+
+        void this.syncIntercomModeToAgent();
     }
 
     getExternalAlarmState(): ExternalAlarmState {
@@ -1050,6 +1059,59 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
 
     getDoorbellPresenceMode(): DoorbellPresenceMode {
         return alarmStateToDoorbellPresenceMode(this.externalAlarmState);
+    }
+
+    async syncIntercomModeToAgent(): Promise<void> {
+        const state = this.getExternalAlarmState();
+
+        let intercomMode: IntercomMode;
+
+        switch (state) {
+            case 'armed_away':
+            case 'armed_vacation':
+            case 'armed_custom_bypass':
+                intercomMode = 'away';
+                break;
+
+            case 'armed_night':
+            case 'triggered':
+                intercomMode = 'night';
+                break;
+
+            case 'armed_home':
+                intercomMode = 'home';
+                break;
+
+            case 'disarmed':
+                intercomMode = 'disarmed';
+                break;
+
+            case 'pending':
+            case 'arming':
+            case 'disarming':
+                this.console.log(
+                    `Keeping current Pi intercom mode during transitional alarm state: ${state}`
+                );
+                return;
+
+            case 'unavailable':
+            case 'unknown':
+            default:
+                intercomMode = 'disarmed';
+                break;
+        }
+
+        try {
+            const intercom = await this.getDevice(
+                GOLMAR_INTERCOM_NATIVE_ID
+            ) as GolmarCameraDevice;
+
+            await intercom.setIntercomMode(intercomMode);
+        } catch (e) {
+            this.console.error(
+                `Failed to synchronize Pi intercom mode for alarm state ${state}: ${e}`
+            );
+        }
     }
 
     connectHomeAssistantWebSocket() {
@@ -1107,6 +1169,9 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
             this.console.warn('Home Assistant WebSocket closed');
             this.haWsConnected = false;
             this.haWs = undefined;
+
+            this.externalAlarmState = 'unknown';
+            void this.syncIntercomModeToAgent();
 
             if (this.getAlarmStateSource() === 'home_assistant') {
                 this.scheduleHomeAssistantReconnect();

@@ -68,19 +68,48 @@ def health():
             "remaining_seconds": package_unlock_remaining_seconds,
             "cooldown_active": package_unlock_remaining_seconds > 0,
         },
+        "intercom_mode": get_intercom_mode(),
         "greeting": {
             "enabled": GREETING_SOUND_ENABLED,
-            "file": GREETING_SOUND_FILE,
-            "file_exists": os.path.isfile(GREETING_SOUND_FILE),
+            "home_file": GREETING_HOME_FILE,
+            "home_file_exists": os.path.isfile(GREETING_HOME_FILE),
+            "away_file": GREETING_AWAY_FILE,
+            "away_file_exists": os.path.isfile(GREETING_AWAY_FILE),
             "cooldown_seconds": GREETING_COOLDOWN_SECONDS,
             "last_greeting_time": last_greeting_time or None,
         },
-        "away_followup": {
-            "enabled": AWAY_FOLLOWUP_ENABLED,
-            "file": AWAY_FOLLOWUP_FILE,
-            "file_exists": os.path.isfile(AWAY_FOLLOWUP_FILE),
-            "delay_seconds": AWAY_FOLLOWUP_DELAY_SECONDS,
+        "away_no_response": {
+            "enabled": AWAY_NO_RESPONSE_ENABLED,
+            "file": AWAY_NO_RESPONSE_FILE,
+            "file_exists": os.path.isfile(AWAY_NO_RESPONSE_FILE),
+            "delay_seconds": AWAY_NO_RESPONSE_DELAY_SECONDS,
         },
+        "time": time.time(),
+    })
+
+@app.post("/intercom-mode")
+def intercom_mode_http():
+    global INTERCOM_MODE
+
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+
+    if mode not in ("home", "away", "night"):
+        return jsonify({
+            "ok": False,
+            "error": "mode must be 'home', 'away' or 'night'",
+            "time": time.time(),
+        }), 400
+
+    with intercom_mode_lock:
+        INTERCOM_MODE = mode
+
+    if mode != "away":
+        cancel_away_no_response(f"intercom mode changed to {mode}")
+
+    return jsonify({
+        "ok": True,
+        "intercom_mode": mode,
         "time": time.time(),
     })
 
@@ -169,7 +198,7 @@ def unlock_door():
     zodat een ontbrekend/kapot audiobestand de unlock-call niet vertraagt
     of vast laat lopen.
     """
-    cancel_away_followup("door unlocked")
+    cancel_away_no_response("door unlocked")
 
     with unlock_lock:
         print("Activating Automation HAT output one", flush=True)
@@ -218,23 +247,24 @@ UNLOCK_SOUND_TIMEOUT_SECONDS = 8
 # Audiobestand dat automatisch bij aanbellen afgespeeld wordt.
 # Kort houden, zodat je snel zelf kunt overnemen.
 GREETING_SOUND_ENABLED = True
-GREETING_SOUND_FILE = str(BASE_DIR / "audio" / "greeting_home.wav")
+
+GREETING_HOME_FILE = str(BASE_DIR / "audio" / "greeting_home.wav")
+GREETING_AWAY_FILE = str(BASE_DIR / "audio" / "greeting_away.wav")
+
 GREETING_SOUND_VOLUME = "5.0"
 GREETING_SOUND_TIMEOUT_SECONDS = 12
-
-# Bericht wanneer ik away ben en niet tijdig reageer.
-AWAY_FOLLOWUP_ENABLED = True
-AWAY_FOLLOWUP_FILE = str(BASE_DIR / "audio" / "away_no_response.wav")
-AWAY_FOLLOWUP_DELAY_SECONDS = 30
-AWAY_FOLLOWUP_VOLUME = "5.0"
-AWAY_FOLLOWUP_TIMEOUT_SECONDS = 12
-
-away_followup_timer = None
-away_followup_lock = threading.Lock()
-away_followup_generation = 0
-# Voorkomt meerdere greetings door bounce / lang indrukken / status-flaps.
 GREETING_COOLDOWN_SECONDS = 20
 last_greeting_time = 0.0
+
+AWAY_NO_RESPONSE_ENABLED = True
+AWAY_NO_RESPONSE_FILE = str(BASE_DIR / "audio" / "away_no_response.wav")
+AWAY_NO_RESPONSE_DELAY_SECONDS = 30
+AWAY_NO_RESPONSE_VOLUME = "5.0"
+AWAY_NO_RESPONSE_TIMEOUT_SECONDS = 8
+
+away_no_response_timer = None
+away_no_response_lock = threading.Lock()
+away_no_response_generation = 0
 
 # Huidige greeting-processen, zodat talkback de greeting kan afbreken.
 greeting_lock = threading.Lock()
@@ -249,6 +279,17 @@ audio_relay_users = 0
 speaker_stream_lock = threading.Lock()
 speaker_stream_active = False
 
+# Gedrag bij aanbellen:
+# - "home": speel greeting_home.wav
+# - "away": speel greeting_away.wav en plan away_no_response.wav
+# - "night": speel niets
+INTERCOM_MODE = "home"
+intercom_mode_lock = threading.Lock()
+
+
+def get_intercom_mode():
+    with intercom_mode_lock:
+        return INTERCOM_MODE
 
 def set_audio_relay(enabled: bool):
     """
@@ -326,79 +367,80 @@ def stop_greeting_sound(reason="unknown"):
         if stopped:
             print(f"Greeting stopped: {reason}", flush=True)
 
-def cancel_away_followup(reason="unknown"):
-    """Annuleer het away-vervolgbericht, bijvoorbeeld zodra talkback of unlock start."""
-    global away_followup_timer, away_followup_generation
+def cancel_away_no_response(reason="unknown"):
+    global away_no_response_timer, away_no_response_generation
 
-    with away_followup_lock:
-        away_followup_generation += 1
+    with away_no_response_lock:
+        away_no_response_generation += 1
 
-        if away_followup_timer:
+        if away_no_response_timer:
             try:
-                away_followup_timer.cancel()
-                print(f"Away follow-up cancelled: {reason}", flush=True)
+                away_no_response_timer.cancel()
+                print(f"Away no-response cancelled: {reason}", flush=True)
             except Exception as e:
-                print(f"Away follow-up cancel failed: {e}", flush=True)
+                print(f"Away no-response cancel failed: {e}", flush=True)
 
-        away_followup_timer = None
+        away_no_response_timer = None
 
 
-def schedule_away_followup():
-    """Plan een vervolgbericht als er na de away greeting geen reactie komt."""
-    global away_followup_timer, away_followup_generation
+def schedule_away_no_response():
+    global away_no_response_timer, away_no_response_generation
 
-    if not AWAY_FOLLOWUP_ENABLED:
+    if not AWAY_NO_RESPONSE_ENABLED:
         return
 
-    if not AWAY_FOLLOWUP_FILE or not os.path.isfile(AWAY_FOLLOWUP_FILE):
-        print(f"Away follow-up skipped: file not found: {AWAY_FOLLOWUP_FILE}", flush=True)
+    if not AWAY_NO_RESPONSE_FILE or not os.path.isfile(AWAY_NO_RESPONSE_FILE):
+        print(f"Away no-response skipped: file not found: {AWAY_NO_RESPONSE_FILE}", flush=True)
         return
 
-    with away_followup_lock:
-        away_followup_generation += 1
-        generation = away_followup_generation
+    with away_no_response_lock:
+        away_no_response_generation += 1
+        generation = away_no_response_generation
 
-        if away_followup_timer:
-            away_followup_timer.cancel()
+        if away_no_response_timer:
+            away_no_response_timer.cancel()
 
         print(
-            f"Away follow-up scheduled in {AWAY_FOLLOWUP_DELAY_SECONDS}s",
+            f"Away no-response scheduled in {AWAY_NO_RESPONSE_DELAY_SECONDS}s",
             flush=True,
         )
 
-        away_followup_timer = threading.Timer(
-            AWAY_FOLLOWUP_DELAY_SECONDS,
-            play_away_followup_if_no_response,
+        away_no_response_timer = threading.Timer(
+            AWAY_NO_RESPONSE_DELAY_SECONDS,
+            play_away_no_response_if_needed,
             args=(generation,),
         )
-        away_followup_timer.daemon = True
-        away_followup_timer.start()
+        away_no_response_timer.daemon = True
+        away_no_response_timer.start()
 
 
-def play_away_followup_if_no_response(generation):
-    """Speel het vervolgbericht alleen als er nog geen talkback/reactie is geweest."""
-    global away_followup_timer
+def play_away_no_response_if_needed(generation):
+    global away_no_response_timer
 
-    with away_followup_lock:
-        if generation != away_followup_generation:
-            print("Away follow-up skipped: stale generation", flush=True)
+    with away_no_response_lock:
+        if generation != away_no_response_generation:
+            print("Away no-response skipped: stale generation", flush=True)
             return
-        away_followup_timer = None
+
+        away_no_response_timer = None
+
+    if get_intercom_mode() != "away":
+        print("Away no-response skipped: intercom mode is no longer away", flush=True)
+        return
 
     with speaker_stream_lock:
         if speaker_stream_active:
-            print("Away follow-up skipped: speaker/talkback stream active", flush=True)
+            print("Away no-response skipped: speaker/talkback stream active", flush=True)
             return
 
     play_audio_file(
-        AWAY_FOLLOWUP_FILE,
-        AWAY_FOLLOWUP_VOLUME,
-        AWAY_FOLLOWUP_TIMEOUT_SECONDS,
-        "Away follow-up",
+        AWAY_NO_RESPONSE_FILE,
+        AWAY_NO_RESPONSE_VOLUME,
+        AWAY_NO_RESPONSE_TIMEOUT_SECONDS,
+        "Away no-response",
     )
 
 def play_audio_file(file_path, volume, timeout_seconds, label):
-    """Speel een audiobestand naar de Golmar speaker via ffmpeg -> aplay."""
     if not file_path or not os.path.isfile(file_path):
         print(f"{label} skipped: file not found: {file_path}", flush=True)
         return
@@ -493,22 +535,26 @@ def play_greeting_sound():
     if not GREETING_SOUND_ENABLED:
         return
 
+    intercom_mode = get_intercom_mode()
+
+    if intercom_mode == "night":
+        print("Greeting skipped: intercom mode is night", flush=True)
+        cancel_away_no_response("intercom mode is night")
+        return
+
+    if intercom_mode not in ("home", "away"):
+        print(f"Greeting skipped: invalid intercom mode: {intercom_mode}", flush=True)
+        return
+
+    is_away = intercom_mode == "away"
+    greeting_file = GREETING_AWAY_FILE if is_away else GREETING_HOME_FILE
+
     now = time.time()
 
     if now - last_greeting_time < GREETING_COOLDOWN_SECONDS:
         remaining = int(GREETING_COOLDOWN_SECONDS - (now - last_greeting_time))
         print(f"Greeting skipped: cooldown active, remaining={remaining}s", flush=True)
         return
-
-    # Pas dit aan aan jouw eigen home/away-koppeling.
-    # Voorbeeld:
-    is_away = get_current_presence_mode() == "away"
-
-    greeting_file = (
-        str(BASE_DIR / "audio" / "greeting_away.wav")
-        if is_away
-        else str(BASE_DIR / "audio" / "greeting_home.wav")
-    )
 
     if not greeting_file or not os.path.isfile(greeting_file):
         print(f"Greeting skipped: file not found: {greeting_file}", flush=True)
@@ -519,26 +565,96 @@ def play_greeting_sound():
             print("Greeting skipped: speaker/talkback stream active", flush=True)
             return
 
+    relay_acquired = False
+
     with greeting_lock:
         if greeting_aplay and greeting_aplay.poll() is None:
             print("Greeting skipped: previous greeting still playing", flush=True)
             return
 
         try:
+            print(f"Playing {intercom_mode} greeting sound: {greeting_file}", flush=True)
             last_greeting_time = now
 
-            play_audio_file(
-                greeting_file,
-                GREETING_SOUND_VOLUME,
-                GREETING_SOUND_TIMEOUT_SECONDS,
-                "Greeting",
-            )
+            audio_relay_acquire()
+            relay_acquired = True
+
+            greeting_ffmpeg = subprocess.Popen([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "warning",
+                "-nostdin",
+                "-i", greeting_file,
+                "-vn",
+                "-af", f"volume={GREETING_SOUND_VOLUME}",
+                "-acodec", "pcm_s16le",
+                "-ac", SPEAKER_CHANNELS,
+                "-ar", SPEAKER_RATE,
+                "-f", "s16le",
+                "pipe:1",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            greeting_aplay = subprocess.Popen([
+                "aplay",
+                "-D", SPEAKER_DEVICE,
+                "-f", "S16_LE",
+                "-r", SPEAKER_RATE,
+                "-c", SPEAKER_CHANNELS,
+            ], stdin=greeting_ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+            if greeting_ffmpeg.stdout:
+                greeting_ffmpeg.stdout.close()
+
+            _, aplay_err = greeting_aplay.communicate(timeout=GREETING_SOUND_TIMEOUT_SECONDS)
+
+            try:
+                ffmpeg_err = greeting_ffmpeg.stderr.read(4096) if greeting_ffmpeg.stderr else b""
+            except Exception:
+                ffmpeg_err = b""
+
+            try:
+                greeting_ffmpeg.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                greeting_ffmpeg.kill()
+
+            if greeting_ffmpeg.returncode not in (0, None):
+                print("Greeting ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
+
+            if greeting_aplay.returncode != 0:
+                print("Greeting aplay error:", aplay_err.decode(errors="replace"), flush=True)
+
+            print(f"{intercom_mode} greeting sound finished", flush=True)
 
             if is_away:
-                schedule_away_followup()
+                schedule_away_no_response()
+
+        except subprocess.TimeoutExpired:
+            print("Greeting timeout; killing playback", flush=True)
+
+            try:
+                if greeting_aplay:
+                    greeting_aplay.kill()
+            except Exception:
+                pass
+
+            try:
+                if greeting_ffmpeg:
+                    greeting_ffmpeg.kill()
+            except Exception:
+                pass
 
         except Exception as e:
             print("Greeting failed:", repr(e), flush=True)
+
+        finally:
+            greeting_ffmpeg = None
+            greeting_aplay = None
+
+            if relay_acquired:
+                try:
+                    audio_relay_release()
+                except Exception as e:
+                    print("Greeting relay release failed:", e, flush=True)
 
 def play_unlock_sound():
     """
@@ -654,7 +770,7 @@ def speaker_raw():
     # Als jij via HomeKit/Safari begint te praten terwijl de greeting loopt,
     # breken we de greeting direct af zodat talkback voorrang heeft.
     stop_greeting_sound("speaker/talkback stream started")
-    cancel_away_followup("speaker/talkback stream started")
+    cancel_away_no_response("speaker/talkback stream started")
 
     total_bytes = 0
     chunks = 0
@@ -750,8 +866,8 @@ def mic_raw():
             "arecord",
             "-D", MIC_DEVICE,
             "-f", "S16_LE",
-            "-r", MIC_RATE,
-            "-c", MIC_CHANNELS,
+            "-r", MIC_INPUT_RATE,
+            "-c", MIC_INPUT_CHANNELS,
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         print("arecord started for mic raw stream", flush=True)

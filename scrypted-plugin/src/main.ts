@@ -147,6 +147,11 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     private piWs: any;
     private piWsConnected = false;
     private reconnectTimer: any;
+
+    private piWsWatchdogTimer: any;
+    private piWsWatchdogRunning = false;
+
+    private readonly piWsWatchdogIntervalMs = 30_000;
     private pendingCommands: PendingWsCommand[] = [];
     private lastDoorbellResetTimer: any;
 
@@ -173,7 +178,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 
         const snapshotUrl = this.getSnapshotUrl();
 
-        this.console.log(`Fetching snapshot: ${snapshotUrl}`);
+        this.console.log('Fetching configured snapshot');
 
         try {
             const response = await fetch(snapshotUrl);
@@ -539,33 +544,148 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
         this.console.log(`Pi WebSocket ping OK: ${JSON.stringify(response)}`);
     }
 
+    startPiWsWatchdog() {
+        if (this.piWsWatchdogTimer) {
+            return;
+        }
+
+        this.console.log(
+            `Starting Pi WebSocket watchdog, interval=${this.piWsWatchdogIntervalMs}ms`
+        );
+
+        this.piWsWatchdogTimer = setInterval(() => {
+            void this.runPiWsWatchdog();
+        }, this.piWsWatchdogIntervalMs);
+    }
+
+    stopPiWsWatchdog() {
+        if (!this.piWsWatchdogTimer) {
+            return;
+        }
+
+        clearInterval(this.piWsWatchdogTimer);
+        this.piWsWatchdogTimer = undefined;
+        this.piWsWatchdogRunning = false;
+
+        this.console.log('Pi WebSocket watchdog stopped');
+    }
+
+    async runPiWsWatchdog(): Promise<void> {
+        if (this.piWsWatchdogRunning) {
+            return;
+        }
+
+        this.piWsWatchdogRunning = true;
+
+        try {
+            if (!this.piWs || !this.piWsConnected) {
+                this.console.warn(
+                    'Pi WebSocket watchdog: connection is not active, reconnecting'
+                );
+                this.forcePiWsReconnect('watchdog found disconnected socket');
+                return;
+            }
+
+            const response = await this.sendPiWsCommand(
+                { type: 'ping' },
+                'pong'
+            );
+
+            this.console.log(
+                `Pi WebSocket watchdog OK: ${JSON.stringify(response)}`
+            );
+        } catch (e) {
+            this.console.error(`Pi WebSocket watchdog failed: ${e}`);
+            this.forcePiWsReconnect('watchdog ping failed');
+        } finally {
+            this.piWsWatchdogRunning = false;
+        }
+    }
+
+    forcePiWsReconnect(reason: string) {
+        this.console.warn(`Forcing Pi WebSocket reconnect: ${reason}`);
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = undefined;
+        }
+
+        const ws = this.piWs;
+
+        this.piWs = undefined;
+        this.piWsConnected = false;
+
+        this.rejectPendingWsCommands(
+            new Error(`Pi WebSocket reconnecting: ${reason}`)
+        );
+
+        if (ws) {
+            try {
+                // Eerst handlers verwijderen, zodat close() niet nog een tweede
+                // reconnect of statuswijziging veroorzaakt.
+                ws.onopen = null;
+                ws.onmessage = null;
+                ws.onerror = null;
+                ws.onclose = null;
+                ws.close();
+            } catch (e) {
+                this.console.warn(`Failed to close Pi WebSocket: ${e}`);
+            }
+        }
+
+        this.schedulePiWsReconnect();
+    }
+
     connectPiWebSocket() {
         const url = this.getPiWsUrl();
 
-        if (this.piWs && this.piWsConnected) {
+        if (this.piWs) {
+            this.console.log(
+                `Pi WebSocket connection attempt skipped; socket already exists, connected=${this.piWsConnected}`
+            );
             return;
         }
 
         const WebSocketImpl = (globalThis as any).WebSocket;
 
         if (!WebSocketImpl) {
-            this.console.error('No global WebSocket implementation available in this Scrypted runtime.');
+            this.console.error(
+                'No global WebSocket implementation available in this Scrypted runtime.'
+            );
+            this.schedulePiWsReconnect();
             return;
         }
 
         this.console.log(`Connecting to Pi WebSocket: ${url}`);
 
+        let ws: any;
+
         try {
-            this.piWs = new WebSocketImpl(url);
+            ws = new WebSocketImpl(url);
+            this.piWs = ws;
         } catch (e) {
             this.console.error(`Failed to create Pi WebSocket: ${e}`);
+            this.piWs = undefined;
+            this.piWsConnected = false;
             this.schedulePiWsReconnect();
             return;
         }
 
-        this.piWs.onopen = () => {
+        ws.onopen = () => {
+            // Negeer callbacks van een inmiddels vervangen socket.
+            if (this.piWs !== ws) {
+                try {
+                    ws.close();
+                } catch (e) {
+                    // Ignore stale socket close errors.
+                }
+                return;
+            }
+
             this.piWsConnected = true;
             this.console.log(`Pi WebSocket connected: ${url}`);
+
+            this.startPiWsWatchdog();
 
             void this.plugin.syncIntercomModeToAgent().catch(e => {
                 this.console.error(
@@ -574,52 +694,56 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
             });
         };
 
-        this.piWs.onmessage = (event: any) => {
+        ws.onmessage = (event: any) => {
+            if (this.piWs !== ws) {
+                return;
+            }
+
             this.handlePiWsMessage(event.data);
         };
 
-        this.piWs.onerror = (event: any) => {
-            this.console.error(`Pi WebSocket error: ${JSON.stringify(event)}`);
+        ws.onerror = (event: any) => {
+            if (this.piWs !== ws) {
+                return;
+            }
+
+            this.console.error(
+                `Pi WebSocket error: ${JSON.stringify(event)}`
+            );
+
+            this.forcePiWsReconnect('WebSocket error');
         };
 
-        this.piWs.onclose = () => {
-            this.console.warn('Pi WebSocket closed');
-            this.piWsConnected = false;
-            this.piWs = undefined;
+        ws.onclose = (event: any) => {
+            if (this.piWs !== ws) {
+                return;
+            }
 
-            this.rejectPendingWsCommands(new Error('Pi WebSocket closed'));
+            this.console.warn(
+                `Pi WebSocket closed: code=${event?.code}, reason=${event?.reason || 'none'}`
+            );
+
+            this.piWs = undefined;
+            this.piWsConnected = false;
+
+            this.rejectPendingWsCommands(
+                new Error('Pi WebSocket closed')
+            );
+
             this.schedulePiWsReconnect();
         };
     }
 
     reconnectPiWebSocket() {
-        this.console.log('Reconnecting Pi WebSocket');
-
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = undefined;
-        }
-
-        if (this.piWs) {
-            try {
-                this.piWs.close();
-            } catch (e) {
-                // ignore
-            }
-
-            this.piWs = undefined;
-            this.piWsConnected = false;
-        }
-
-        this.rejectPendingWsCommands(new Error('Pi WebSocket reconnecting'));
-
-        setTimeout(() => this.connectPiWebSocket(), 500);
+        this.forcePiWsReconnect('manual reconnect requested');
     }
 
     schedulePiWsReconnect() {
         if (this.reconnectTimer) {
             return;
         }
+
+        this.console.log('Scheduling Pi WebSocket reconnect in 3 seconds');
 
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = undefined;
@@ -713,7 +837,7 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
     }
 
     async sendPiWsCommand(command: any, expectedType: string): Promise<any> {
-        if (!this.piWs || !this.piWsConnected) {
+        if (!this.piWs) {
             this.connectPiWebSocket();
         }
 

@@ -94,10 +94,12 @@ def intercom_mode_http():
     data = request.get_json(silent=True) or {}
     mode = data.get("mode")
 
-    if mode not in ("home", "away", "night"):
+    if mode not in ("home", "away", "night", "disarmed"):
         return jsonify({
             "ok": False,
-            "error": "mode must be 'home', 'away' or 'night'",
+            "error": (
+                "mode must be 'home', 'away', 'night' or 'disarmed'"
+            ),
             "time": time.time(),
         }), 400
 
@@ -106,6 +108,9 @@ def intercom_mode_http():
 
     if mode != "away":
         cancel_away_no_response(f"intercom mode changed to {mode}")
+
+    if mode in ("night", "disarmed"):
+        stop_greeting_sound(f"intercom mode changed to {mode}")
 
     return jsonify({
         "ok": True,
@@ -283,7 +288,8 @@ speaker_stream_active = False
 # - "home": speel greeting_home.wav
 # - "away": speel greeting_away.wav en plan away_no_response.wav
 # - "night": speel niets
-INTERCOM_MODE = "home"
+# - "disarmed": speel niets
+INTERCOM_MODE = "disarmed"
 intercom_mode_lock = threading.Lock()
 
 
@@ -537,13 +543,24 @@ def play_greeting_sound():
 
     intercom_mode = get_intercom_mode()
 
-    if intercom_mode == "night":
-        print("Greeting skipped: intercom mode is night", flush=True)
-        cancel_away_no_response("intercom mode is night")
+    if intercom_mode in ("night", "disarmed"):
+        print(
+            f"Greeting skipped: intercom mode is {intercom_mode}",
+            flush=True,
+        )
+        cancel_away_no_response(
+            f"intercom mode is {intercom_mode}"
+        )
         return
 
     if intercom_mode not in ("home", "away"):
-        print(f"Greeting skipped: invalid intercom mode: {intercom_mode}", flush=True)
+        print(
+            f"Greeting skipped: invalid intercom mode: {intercom_mode}",
+            flush=True,
+        )
+        cancel_away_no_response(
+            f"invalid intercom mode: {intercom_mode}"
+        )
         return
 
     is_away = intercom_mode == "away"

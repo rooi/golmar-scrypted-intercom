@@ -32,6 +32,9 @@ PACKAGE_UNLOCK_COOLDOWN_SECONDS = 60
 package_unlock_lock = threading.Lock()
 last_package_unlock_time = 0.0
 
+PACKAGE_MODE = False
+package_mode_state_lock = threading.Lock()
+
 # Deze waarde werkte bij jou blijkbaar al.
 # Eventueel later tunen als hij te gevoelig of juist niet gevoelig genoeg is.
 doorbell_threshold = 0.25
@@ -69,6 +72,7 @@ def health():
             "cooldown_active": package_unlock_remaining_seconds > 0,
         },
         "intercom_mode": get_intercom_mode(),
+        "package_mode": get_package_mode(),
         "greeting": {
             "enabled": GREETING_SOUND_ENABLED,
             "home_file": GREETING_HOME_FILE,
@@ -115,6 +119,33 @@ def intercom_mode_http():
     return jsonify({
         "ok": True,
         "intercom_mode": mode,
+        "time": time.time(),
+    })
+
+@app.post("/package-mode")
+def package_mode_http():
+    data = request.get_json(silent=True) or {}
+    enabled = data.get("enabled")
+
+    if not isinstance(enabled, bool):
+        return jsonify({
+            "ok": False,
+            "error": "enabled must be a boolean",
+            "time": time.time(),
+        }), 400
+
+    set_package_mode(enabled)
+
+    if enabled:
+        # Pakketmodus heeft voorrang op gewone home/away-greetings.
+        cancel_away_no_response("package mode enabled")
+        stop_greeting_sound("package mode enabled")
+
+    print(f"Package mode set to {enabled}", flush=True)
+
+    return jsonify({
+        "ok": True,
+        "package_mode": enabled,
         "time": time.time(),
     })
 
@@ -204,6 +235,7 @@ def unlock_door():
     of vast laat lopen.
     """
     cancel_away_no_response("door unlocked")
+    stop_greeting_sound("door unlocked")
 
     with unlock_lock:
         print("Activating Automation HAT output one", flush=True)
@@ -297,6 +329,19 @@ def get_intercom_mode():
     with intercom_mode_lock:
         return INTERCOM_MODE
 
+
+def get_package_mode():
+    with package_mode_state_lock:
+        return PACKAGE_MODE
+
+
+def set_package_mode(enabled: bool):
+    global PACKAGE_MODE
+
+    with package_mode_state_lock:
+        PACKAGE_MODE = enabled
+
+
 def set_audio_relay(enabled: bool):
     """
     Schakel de NO relay voor audio-out.
@@ -350,28 +395,34 @@ def audio_relay_release():
 
 def stop_greeting_sound(reason="unknown"):
     """
-    Stop de greeting direct, bijvoorbeeld wanneer HomeKit/Safari talkback start.
-    Veilig: killt alleen de greeting-processen, niet de speaker_raw talkback-stream.
+    Stop de greeting direct, bijvoorbeeld wanneer HomeKit/Safari talkback start
+    of wanneer pakketmodus de deur automatisch gaat openen.
+
+    De proces-referenties worden onder lock losgekoppeld, maar de processen
+    worden buiten de lock gekilled. Daardoor kan deze functie ook echt een
+    lopende greeting afbreken.
     """
     global greeting_ffmpeg, greeting_aplay
 
     with greeting_lock:
-        stopped = False
-
-        for proc_name, proc in (("aplay", greeting_aplay), ("ffmpeg", greeting_ffmpeg)):
-            if proc and proc.poll() is None:
-                try:
-                    print(f"Stopping greeting {proc_name}: {reason}", flush=True)
-                    proc.kill()
-                    stopped = True
-                except Exception as e:
-                    print(f"Failed to stop greeting {proc_name}: {e}", flush=True)
-
+        ffmpeg = greeting_ffmpeg
+        aplay = greeting_aplay
         greeting_ffmpeg = None
         greeting_aplay = None
 
-        if stopped:
-            print(f"Greeting stopped: {reason}", flush=True)
+    stopped = False
+
+    for proc_name, proc in (("aplay", aplay), ("ffmpeg", ffmpeg)):
+        if proc and proc.poll() is None:
+            try:
+                print(f"Stopping greeting {proc_name}: {reason}", flush=True)
+                proc.kill()
+                stopped = True
+            except Exception as e:
+                print(f"Failed to stop greeting {proc_name}: {e}", flush=True)
+
+    if stopped:
+        print(f"Greeting stopped: {reason}", flush=True)
 
 def cancel_away_no_response(reason="unknown"):
     global away_no_response_timer, away_no_response_generation
@@ -432,6 +483,10 @@ def play_away_no_response_if_needed(generation):
 
     if get_intercom_mode() != "away":
         print("Away no-response skipped: intercom mode is no longer away", flush=True)
+        return
+
+    if get_package_mode():
+        print("Away no-response skipped: package mode active", flush=True)
         return
 
     with speaker_stream_lock:
@@ -541,6 +596,14 @@ def play_greeting_sound():
     if not GREETING_SOUND_ENABLED:
         return
 
+    # Pakketmodus wordt vooraf vanuit Scrypted gesynchroniseerd. Daardoor weet
+    # de Pi dit al op het moment dat de fysieke beldruk binnenkomt en wordt de
+    # normale home/away-greeting niet gestart.
+    if get_package_mode():
+        print("Greeting skipped: package mode active", flush=True)
+        cancel_away_no_response("package mode active")
+        return
+
     intercom_mode = get_intercom_mode()
 
     if intercom_mode in ("night", "disarmed"):
@@ -582,11 +645,21 @@ def play_greeting_sound():
             print("Greeting skipped: speaker/talkback stream active", flush=True)
             return
 
+    ffmpeg = None
+    aplay = None
     relay_acquired = False
+    playback_completed = False
 
+    # Reserveer de greeting-slot alleen voor de processtart. De lock blijft niet
+    # vast tijdens communicate(), zodat stop_greeting_sound() direct kan killen.
     with greeting_lock:
         if greeting_aplay and greeting_aplay.poll() is None:
             print("Greeting skipped: previous greeting still playing", flush=True)
+            return
+
+        # Package mode kan tussen de eerdere check en processtart zijn aangezet.
+        if get_package_mode():
+            print("Greeting skipped: package mode became active", flush=True)
             return
 
         try:
@@ -596,7 +669,7 @@ def play_greeting_sound():
             audio_relay_acquire()
             relay_acquired = True
 
-            greeting_ffmpeg = subprocess.Popen([
+            ffmpeg = subprocess.Popen([
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "warning",
@@ -611,67 +684,95 @@ def play_greeting_sound():
                 "pipe:1",
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            greeting_aplay = subprocess.Popen([
+            aplay = subprocess.Popen([
                 "aplay",
                 "-D", SPEAKER_DEVICE,
                 "-f", "S16_LE",
                 "-r", SPEAKER_RATE,
                 "-c", SPEAKER_CHANNELS,
-            ], stdin=greeting_ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            ], stdin=ffmpeg.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-            if greeting_ffmpeg.stdout:
-                greeting_ffmpeg.stdout.close()
+            greeting_ffmpeg = ffmpeg
+            greeting_aplay = aplay
 
-            _, aplay_err = greeting_aplay.communicate(timeout=GREETING_SOUND_TIMEOUT_SECONDS)
-
-            try:
-                ffmpeg_err = greeting_ffmpeg.stderr.read(4096) if greeting_ffmpeg.stderr else b""
-            except Exception:
-                ffmpeg_err = b""
-
-            try:
-                greeting_ffmpeg.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                greeting_ffmpeg.kill()
-
-            if greeting_ffmpeg.returncode not in (0, None):
-                print("Greeting ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
-
-            if greeting_aplay.returncode != 0:
-                print("Greeting aplay error:", aplay_err.decode(errors="replace"), flush=True)
-
-            print(f"{intercom_mode} greeting sound finished", flush=True)
-
-            if is_away:
-                schedule_away_no_response()
-
-        except subprocess.TimeoutExpired:
-            print("Greeting timeout; killing playback", flush=True)
-
-            try:
-                if greeting_aplay:
-                    greeting_aplay.kill()
-            except Exception:
-                pass
-
-            try:
-                if greeting_ffmpeg:
-                    greeting_ffmpeg.kill()
-            except Exception:
-                pass
+            if ffmpeg.stdout:
+                ffmpeg.stdout.close()
 
         except Exception as e:
-            print("Greeting failed:", repr(e), flush=True)
-
-        finally:
             greeting_ffmpeg = None
             greeting_aplay = None
 
             if relay_acquired:
                 try:
                     audio_relay_release()
-                except Exception as e:
-                    print("Greeting relay release failed:", e, flush=True)
+                except Exception as relay_error:
+                    print("Greeting relay release failed:", relay_error, flush=True)
+
+            print("Greeting failed to start:", repr(e), flush=True)
+            return
+
+    try:
+        _, aplay_err = aplay.communicate(timeout=GREETING_SOUND_TIMEOUT_SECONDS)
+
+        try:
+            ffmpeg_err = ffmpeg.stderr.read(4096) if ffmpeg.stderr else b""
+        except Exception:
+            ffmpeg_err = b""
+
+        try:
+            ffmpeg.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            ffmpeg.kill()
+
+        if ffmpeg.returncode not in (0, None):
+            print("Greeting ffmpeg error:", ffmpeg_err.decode(errors="replace"), flush=True)
+
+        if aplay.returncode != 0:
+            print("Greeting aplay error:", aplay_err.decode(errors="replace"), flush=True)
+
+        playback_completed = (
+            aplay.returncode == 0
+            and ffmpeg.returncode in (0, None)
+        )
+
+        if playback_completed:
+            print(f"{intercom_mode} greeting sound finished", flush=True)
+        else:
+            print(f"{intercom_mode} greeting sound stopped before completion", flush=True)
+
+        if is_away and playback_completed and not get_package_mode():
+            schedule_away_no_response()
+
+    except subprocess.TimeoutExpired:
+        print("Greeting timeout; killing playback", flush=True)
+
+        try:
+            if aplay:
+                aplay.kill()
+        except Exception:
+            pass
+
+        try:
+            if ffmpeg:
+                ffmpeg.kill()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print("Greeting failed:", repr(e), flush=True)
+
+    finally:
+        with greeting_lock:
+            if greeting_ffmpeg is ffmpeg:
+                greeting_ffmpeg = None
+            if greeting_aplay is aplay:
+                greeting_aplay = None
+
+        if relay_acquired:
+            try:
+                audio_relay_release()
+            except Exception as e:
+                print("Greeting relay release failed:", e, flush=True)
 
 def play_unlock_sound():
     """
@@ -1493,6 +1594,7 @@ async def handle_ws(websocket):
             "doorbell": doorbell_pressed,
             "voltage": doorbell_voltage,
             "threshold": doorbell_threshold,
+            "package_mode": get_package_mode(),
             "time": time.time(),
         }))
 
@@ -1550,6 +1652,7 @@ async def handle_ws(websocket):
                     "threshold": doorbell_threshold,
                     "ws_clients": len(clients),
                     "last_doorbell_event": last_doorbell_event,
+                    "package_mode": get_package_mode(),
                     "time": time.time(),
                 }))
 

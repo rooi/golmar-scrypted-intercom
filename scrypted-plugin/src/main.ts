@@ -35,6 +35,7 @@ const { deviceManager, mediaManager } = sdk;
 const GOLMAR_INTERCOM_NATIVE_ID = 'golmar-intercom';
 const GOLMAR_LOCK_NATIVE_ID = 'golmar-lock';
 const PACKAGE_MODE_NATIVE_ID = 'golmar-package-mode';
+const PACKAGE_UNLOCK_SENSOR_NATIVE_ID = 'golmar-package-unlock';
 
 const PACKAGE_MODE_DURATION_MS = 8 * 60 * 60 * 1000;
 
@@ -975,11 +976,28 @@ class GolmarCameraDevice extends ScryptedDeviceBase implements Intercom, Camera,
 }
 
 class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
+    private relockTimer: any;
+
     constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
         super(nativeId);
 
         // De Golmar opener is momentary; normaal is hij dus "locked".
         this.lockState = LockState.Locked;
+    }
+
+    reportSuccessfulUnlock(reason: string) {
+        this.console.log(`Golmar unlock successfully executed: ${reason}`);
+
+        if (this.relockTimer) {
+            clearTimeout(this.relockTimer);
+        }
+
+        this.lockState = LockState.Unlocked;
+
+        this.relockTimer = setTimeout(() => {
+            this.lockState = LockState.Locked;
+            this.relockTimer = undefined;
+        }, 2000);
     }
 
     async unlock(): Promise<void> {
@@ -988,17 +1006,42 @@ class GolmarLockDevice extends ScryptedDeviceBase implements Lock {
         const intercom = await this.plugin.getDevice(GOLMAR_INTERCOM_NATIVE_ID) as GolmarCameraDevice;
         await intercom.unlockDoor();
 
-        this.lockState = LockState.Unlocked;
-
-        setTimeout(() => {
-            this.lockState = LockState.Locked;
-        }, 2000);
+        this.reportSuccessfulUnlock('HomeKit/manual');
     }
 
     async lock(): Promise<void> {
         // De fysieke opener kan niet actief "locken"; hij stopt vanzelf.
         this.console.log('HomeKit requested lock; Golmar opener is momentary, setting state to locked.');
+
+        if (this.relockTimer) {
+            clearTimeout(this.relockTimer);
+            this.relockTimer = undefined;
+        }
+
         this.lockState = LockState.Locked;
+    }
+}
+
+class GolmarPackageUnlockSensor extends ScryptedDeviceBase implements BinarySensor {
+    private resetTimer: any;
+
+    constructor(public plugin: GolmarCameraPlugin, nativeId: string) {
+        super(nativeId);
+        this.binaryState = false;
+    }
+
+    trigger() {
+        if (this.resetTimer) {
+            clearTimeout(this.resetTimer);
+        }
+
+        this.console.log('Successful package unlock event');
+        this.binaryState = true;
+
+        this.resetTimer = setTimeout(() => {
+            this.binaryState = false;
+            this.resetTimer = undefined;
+        }, 3000);
     }
 }
 
@@ -1484,13 +1527,25 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
                     ScryptedInterface.OnOff,
                 ],
             },
+            {
+                info: {
+                    model: 'Package Unlock Event',
+                    manufacturer: 'Golmar',
+                },
+                nativeId: PACKAGE_UNLOCK_SENSOR_NATIVE_ID,
+                name: 'Pakketdeur ontgrendeld',
+                type: ScryptedDeviceType.Sensor,
+                interfaces: [
+                    ScryptedInterface.BinarySensor,
+                ],
+            },
         ];
 
         await deviceManager.onDevicesChanged({
             devices,
         });
 
-        this.console.log('discovered Golmar Intercom doorbell, lock device and Pakketmodus switch');
+        this.console.log('discovered Golmar Intercom doorbell, lock device, Pakketmodus switch and package unlock sensor');
     }
 
     async getDevice(nativeId: string) {
@@ -1503,6 +1558,8 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
                 device = new GolmarLockDevice(this, nativeId);
             } else if (nativeId === PACKAGE_MODE_NATIVE_ID) {
                 device = new GolmarPackageModeSwitch(this, nativeId);
+            } else if (nativeId === PACKAGE_UNLOCK_SENSOR_NATIVE_ID) {
+                device = new GolmarPackageUnlockSensor(this, nativeId);
             } else {
                 throw new Error(`Unknown nativeId: ${nativeId}`);
             }
@@ -1646,7 +1703,25 @@ class GolmarCameraPlugin extends ScryptedDeviceBase implements DeviceProvider, S
         try {
             this.console.log('Package mode doorbell accepted: calling /package-unlock');
             await camera.packageUnlockDoor();
-            this.console.log('Package mode unlock completed; disabling package mode');
+
+            // /package-unlock returns success only after the Pi agent has completed
+            // the physical opener pulse. Report that confirmed action to the existing
+            // lock accessory without activating the physical opener a second time.
+            this.console.log('Package mode physical unlock completed');
+
+            const lock = await this.getDevice(
+                GOLMAR_LOCK_NATIVE_ID
+            ) as GolmarLockDevice;
+            lock.reportSuccessfulUnlock('package mode');
+
+            // Separate momentary sensor for Scrypted NVR/timeline notifications.
+            // This indicates a confirmed opener pulse, not a physical door contact.
+            const packageUnlockSensor = await this.getDevice(
+                PACKAGE_UNLOCK_SENSOR_NATIVE_ID
+            ) as GolmarPackageUnlockSensor;
+            packageUnlockSensor.trigger();
+
+            this.console.log('Package mode unlock reported; disabling package mode');
             await this.setPackageMode(false, 'used');
         } catch (e) {
             this.console.error(`Package mode unlock failed or was rejected: ${e}`);
